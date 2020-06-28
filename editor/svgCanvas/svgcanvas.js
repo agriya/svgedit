@@ -1,0 +1,4357 @@
+/* eslint-disable indent, unicorn/no-fn-reference-in-iterator */
+/* globals jQuery, jsPDF */
+/**
+ * Numerous tools for working with the editor's "canvas".
+ * @module svgcanvas
+ *
+ * @license MIT
+ *
+ * @copyright 2010 Alexis Deveria, 2010 Pavol Rusnak, 2010 Jeff Schiller
+ *
+ */
+
+/* Dependencies:
+1. Also expects jQuery UI for `svgCanvasToString` and
+`convertToGroup` use of `:data()` selector
+*/
+
+// Todo: Obtain/adapt latest jsPDF to utilize ES Module for `jsPDF`/avoid global
+
+import '../svgpathseg.js';
+import jQueryPluginSVG from '../jQuery.attr.js'; // Needed for SVG attribute setting and array form with `attr`
+import jQueryPluginDBox from '../dbox.js';
+import * as draw from '../draw.js';
+// eslint-disable-next-line no-duplicate-imports
+import {
+  identifyLayers, createLayer, cloneLayer, deleteCurrentLayer,
+  setCurrentLayer, renameCurrentLayer, setCurrentLayerPosition,
+  setLayerVisibility, moveSelectedToLayer, mergeLayer, mergeAllLayers,
+  leaveContext, setContext
+} from '../draw.js';
+import * as pathModule from './path.js';
+import {sanitizeSvg} from './sanitize.js';
+import {getReverseNS, NS} from './namespaces.js';
+import {importSetGlobal, importScript} from './external/dynamic-import-polyfill/importModule.js';
+import {
+  text2xml, assignAttributes, cleanupElement, getElem, getUrlFromAttr,
+  findDefs, getHref, setHref, getRefElem, getRotationAngle, getPathBBox,
+  preventClickDefault, snapToGrid, walkTree, walkTreePost,
+  getBBoxOfElementAsPath, convertToPath, toXml, encode64, decode64,
+  dataURLToObjectURL, createObjectURL,
+  getVisibleElements, dropXMLInternalSubset,
+  init as utilsInit, getBBox as utilsGetBBox, getStrokedBBoxDefaultVisible,
+  isNullish
+} from './utilities.js';
+import * as hstry from './history.js';
+import {
+  transformPoint, matrixMultiply, hasMatrixTransform, transformListToTransform,
+  getMatrix, snapToAngle, isIdentity, rectsIntersect, transformBox
+} from './math.js';
+import {
+  convertToNum, convertAttrs, convertUnit, shortFloat, getTypeMap,
+  init as unitsInit
+} from './units.js';
+import {
+  isGecko, isChrome, isIE, isWebkit, supportsNonScalingStroke, supportsGoodTextCharPos
+} from './browser.js'; // , supportsEditableText
+import {
+  getTransformList, resetListMap,
+  SVGTransformList as SVGEditTransformList
+} from './svgtransformlist.js';
+import {
+  remapElement,
+  init as coordsInit
+} from './coords.js';
+import {
+  recalculateDimensions,
+  init as recalculateInit
+} from './recalculate.js';
+import {
+  getSelectorManager,
+  Selector,
+  init as selectInit
+} from './select.js';
+
+let $ = jQueryPluginSVG(jQuery);
+const {
+  MoveElementCommand, InsertElementCommand, RemoveElementCommand,
+  ChangeElementCommand, BatchCommand, UndoManager, HistoryEventTypes
+} = hstry;
+
+if (!window.console) {
+  window.console = {};
+  window.console.log = function (str) { /* */ };
+  window.console.dir = function (str) { /* */ };
+}
+
+if (window.opera) {
+  window.console.log = function (str) { window.opera.postError(str); };
+  window.console.dir = function (str) { /* */ };
+}
+
+// Reenable after fixing eslint-plugin-jsdoc to handle
+/**
+* The main SvgCanvas class that manages all SVG-related functions.
+* @memberof module:svgcanvas
+*
+* @borrows module:coords.remapElement as #remapElement
+* @borrows module:recalculate.recalculateDimensions as #recalculateDimensions
+*
+* @borrows module:utilities.cleanupElement as #cleanupElement
+* @borrows module:utilities.getStrokedBBoxDefaultVisible as #getStrokedBBox
+* @borrows module:utilities.getVisibleElements as #getVisibleElements
+* @borrows module:utilities.findDefs as #findDefs
+* @borrows module:utilities.getUrlFromAttr as #getUrlFromAttr
+* @borrows module:utilities.getHref as #getHref
+* @borrows module:utilities.setHref as #setHref
+* @borrows module:utilities.getRotationAngle as #getRotationAngle
+* @borrows module:utilities.getBBox as #getBBox
+* @borrows module:utilities.getElem as #getElem
+* @borrows module:utilities.getRefElem as #getRefElem
+* @borrows module:utilities.assignAttributes as #assignAttributes
+*
+* @borrows module:SVGTransformList.getTransformList as #getTransformList
+* @borrows module:math.matrixMultiply as #matrixMultiply
+* @borrows module:math.hasMatrixTransform as #hasMatrixTransform
+* @borrows module:math.transformListToTransform as #transformListToTransform
+* @borrows module:units.convertToNum as #convertToNum
+* @borrows module:sanitize.sanitizeSvg as #sanitizeSvg
+* @borrows module:path.pathActions.linkControlPoints as #linkControlPoints
+*/
+class SvgCanvas {
+  /**
+  * @param {HTMLElement} container - The container HTML element that should hold the SVG root element
+  * @param {module:SVGEditor.curConfig} config - An object that contains configuration data
+  */
+  constructor (container, config) {
+    // Default configuration options
+    // with Update config with new one if given
+    const curConfig = {
+      show_outside_canvas: true,
+      selectNew: true,
+      dimensions: [640, 480],
+      ...config
+    };
+
+    // Array with width/height of canvas
+    const {dimensions} = curConfig;
+
+    // "document" element associated with the container (same as window.document using default svg-editor.js)
+    // NOTE: This is not actually a SVG document, but an HTML document.
+    this.svgdoc = container.ownerDocument;
+
+    // This is a container for the document being edited, not the document itself.
+    /**
+     * @name module:svgcanvas~svgroot
+     * @type {SVGSVGElement}
+     */
+    this.svgroot = this.svgdoc.importNode(
+      text2xml(
+        '<svg id="svgroot" xmlns="' + NS.SVG + '" xlinkns="' + NS.XLINK + '" ' +
+          'width="' + dimensions[0] + '" height="' + dimensions[1] + '" x="' + dimensions[0] + '" y="' + dimensions[1] + '" overflow="visible">' +
+          '<defs>' +
+            '<filter id="canvashadow" filterUnits="objectBoundingBox">' +
+              '<feGaussianBlur in="SourceAlpha" stdDeviation="4" result="blur"/>' +
+              '<feOffset in="blur" dx="5" dy="5" result="offsetBlur"/>' +
+              '<feMerge>' +
+                '<feMergeNode in="offsetBlur"/>' +
+                '<feMergeNode in="SourceGraphic"/>' +
+              '</feMerge>' +
+            '</filter>' +
+          '</defs>' +
+        '</svg>'
+      ).documentElement,
+      true
+    );
+    container.append(this.svgroot);
+
+    /**
+     * The actual element that represents the final output SVG element.
+     * @name module:svgcanvas~svgcontent
+     * @type {SVGSVGElement}
+     */
+    this.svgContent = this.svgdoc.createElementNS(NS.SVG, 'svg');
+
+    this.clearSvgContentElement();
+
+    // Prefix string for element IDs
+    this.idprefix = 'svg_';
+
+    /**
+    * Current `draw.Drawing` object.
+    * @type {module:draw.Drawing}
+    * @name module:svgcanvas.SvgCanvas#current_drawing_
+    */
+    this.current_drawing_ = new draw.Drawing(this.svgContent, this.idprefix );
+
+    /**
+    * Float displaying the current zoom level (1 = 100%, .5 = 50%, etc.).
+    * @type {Float}
+    */
+    let currentZoom = 1;
+
+    // pointer to current group (for in-group editing)
+    let currentGroup = null;
+
+    // Object containing data for the currently selected styles
+    const allProperties = {
+      shape: {
+        fill: (curConfig.initFill.color === 'none' ? '' : '#') + curConfig.initFill.color,
+        fill_paint: null,
+        fill_opacity: curConfig.initFill.opacity,
+        stroke: '#' + curConfig.initStroke.color,
+        stroke_paint: null,
+        stroke_opacity: curConfig.initStroke.opacity,
+        stroke_width: curConfig.initStroke.width,
+        stroke_dasharray: 'none',
+        stroke_linejoin: 'miter',
+        stroke_linecap: 'butt',
+        opacity: curConfig.initOpacity
+      }
+    };
+
+    allProperties.text = $.extend(true, {}, allProperties.shape);
+    $.extend(allProperties.text, {
+      fill: '#000000',
+      stroke_width: curConfig.text && curConfig.text.stroke_width,
+      font_size: curConfig.text && curConfig.text.font_size,
+      font_family: curConfig.text && curConfig.text.font_family
+    });
+
+    // Current shape style properties
+    const curShape = allProperties.shape;
+
+    // Array with all the currently selected elements
+    // default size of 1 until it needs to grow bigger
+    let selectedElements = [];
+
+
+
+canvas.getTransformList = getTransformList;
+
+canvas.matrixMultiply = matrixMultiply;
+canvas.hasMatrixTransform = hasMatrixTransform;
+canvas.transformListToTransform = transformListToTransform;
+
+/**
+* @type {module:utilities.EditorContext#getBaseUnit}
+*/
+const getBaseUnit = () => { return curConfig.baseUnit; };
+
+/**
+* Initialize from units.js.
+* Send in an object implementing the ElementContainer interface (see units.js).
+*/
+unitsInit(
+  /**
+  * @implements {module:units.ElementContainer}
+  */
+  {
+    getBaseUnit,
+    getElement: getElem,
+    getHeight () { return this.svgContent.getAttribute('height') / currentZoom; },
+    getWidth () { return this.svgContent.getAttribute('width') / currentZoom; },
+    getRoundDigits () { return saveOptions.round_digits; }
+  }
+);
+
+canvas.convertToNum = convertToNum;
+
+const {pathActions} = pathModule;
+
+utilsInit(
+  /**
+  * @implements {module:utilities.EditorContext}
+  */
+  {
+    pathActions, // Ok since not modifying
+    getSVGContent,
+    addSVGElementFromJson,
+    getSelectedElements,
+    getDOMDocument () { return this.svgdoc; },
+    getDOMContainer () { return container; },
+    getSVGRoot,
+    // TODO: replace this mostly with a way to get the current drawing.
+    getBaseUnit,
+    getSnappingStep () { return curConfig.snappingStep; }
+  }
+);
+
+this.findDefs = findDefs;
+this.getUrlFromAttr = getUrlFromAttr;
+this.getHref = getHref;
+this.setHref = setHref;
+this.getBBox = utilsGetBBox;
+this.getRotationAngle = getRotationAngle;
+this.getElem = getElem;
+this.getRefElem = getRefElem;
+this.assignAttributes = assignAttributes;
+this.cleanupElement = cleanupElement;
+
+coordsInit(
+  /**
+  * @implements {module:coords.EditorContext}
+  */
+  {
+    getDrawing () { return getCurrentDrawing(); },
+    getSVGRoot,
+    getGridSnapping
+  }
+);
+this.remapElement = remapElement;
+
+recalculateInit(
+  /**
+  * @implements {module:recalculate.EditorContext}
+  */
+  {
+    getSVGRoot,
+    getStartTransform () { return startTransform; },
+    setStartTransform (transform) { startTransform = transform; }
+  }
+);
+this.recalculateDimensions = recalculateDimensions;
+
+// import from sanitize.js
+const nsMap = getReverseNS();
+this.sanitizeSvg = sanitizeSvg;
+
+
+/**
+* This should really be an intersection applying to all types rather than a union.
+* @name module:svgcanvas.SvgCanvas#getZoom
+* @type {module:path.EditorContext#getCurrentZoom|module:select.SVGFactory#getCurrentZoom}
+*/
+const getCurrentZoom = this.getZoom = function () { return currentZoom; };
+
+/**
+* This method rounds the incoming value to the nearest value based on the `currentZoom`
+* @name module:svgcanvas.SvgCanvas#round
+* @type {module:path.EditorContext#round}
+*/
+const round = this.round = function (val) {
+  return Number.parseInt(val * currentZoom) / currentZoom;
+};
+
+selectInit(
+  curConfig,
+  /**
+  * Export to select.js.
+  * @implements {module:select.SVGFactory}
+  */
+  {
+    createSVGElement (jsonMap) { return canvas.addSVGElementFromJson(jsonMap); },
+    svgRoot () { return this.svgroot; },
+    svgContent () { return svgcontent; },
+    getCurrentZoom
+  }
+);
+/**
+* This object manages selectors for us.
+* @name module:svgcanvas.SvgCanvas#selectorManager
+* @type {module:select.SelectorManager}
+*/
+const selectorManager = this.selectorManager = getSelectorManager();
+
+/**
+* @name module:svgcanvas.SvgCanvas#getNextId
+* @type {module:path.EditorContext#getNextId}
+*/
+const getNextId = canvas.getNextId = function () {
+  return getCurrentDrawing().getNextId();
+};
+
+/**
+* @name module:svgcanvas.SvgCanvas#getId
+* @type {module:path.EditorContext#getId}
+*/
+const getId = canvas.getId = function () {
+  return getCurrentDrawing().getId();
+};
+
+/**
+* The "implements" should really be an intersection applying to all types rather than a union.
+* @name module:svgcanvas.SvgCanvas#call
+* @type {module:draw.DrawCanvasInit#call|module:path.EditorContext#call}
+*/
+const call = function (ev, arg) {
+  if (events[ev]) {
+    return events[ev](window, arg);
+  }
+  return undefined;
+};
+
+/**
+* @type {module:path.EditorContext#getOpacity}
+*/
+const getOpacity = function () {
+  return curShape.opacity;
+};
+
+/**
+* @namespace {module:path.pathActions} pathActions
+* @memberof module:svgcanvas.SvgCanvas#
+* @see module:path.pathActions
+*/
+canvas.pathActions = pathActions;
+/**
+* @type {module:path.EditorContext#resetD}
+*/
+function resetD (p) {
+  p.setAttribute('d', pathActions.convertPath(p));
+}
+pathModule.init(
+  /**
+  * @implements {module:path.EditorContext}
+  */
+  {
+    selectorManager, // Ok since not changing
+    canvas, // Ok since not changing
+    call,
+    resetD,
+    round,
+    clearSelection,
+    addToSelection,
+    addCommandToHistory,
+    remapElement,
+    addSVGElementFromJson,
+    getGridSnapping,
+    getOpacity,
+    getSelectedElements,
+    getContainer () {
+      return container;
+    },
+    setStarted (s) {
+      started = s;
+    },
+    getRubberBox () {
+      return rubberBox;
+    },
+    setRubberBox (rb) {
+      rubberBox = rb;
+      return rubberBox;
+    },
+    /**
+     * @param {PlainObject} ptsInfo
+     * @param {boolean} ptsInfo.closedSubpath
+     * @param {SVGCircleElement[]} ptsInfo.grips
+     * @fires module:svgcanvas.SvgCanvas#event:pointsAdded
+     * @fires module:svgcanvas.SvgCanvas#event:selected
+     * @returns {void}
+     */
+    addPtsToSelection ({closedSubpath, grips}) {
+      // TODO: Correct this:
+      pathActions.canDeleteNodes = true;
+      pathActions.closed_subpath = closedSubpath;
+      call('pointsAdded', {closedSubpath, grips});
+      call('selected', grips);
+    },
+    /**
+     * @param {PlainObject} changes
+     * @param {ChangeElementCommand} changes.cmd
+     * @param {SVGPathElement} changes.elem
+     * @fires module:svgcanvas.SvgCanvas#event:changed
+     * @returns {void}
+     */
+    endChanges ({cmd, elem}) {
+      addCommandToHistory(cmd);
+      call('changed', [elem]);
+    },
+    getCurrentZoom,
+    getId,
+    getNextId,
+    getMouseTarget,
+    getCurrentMode () {
+      return currentMode;
+    },
+    setCurrentMode (cm) {
+      currentMode = cm;
+      return currentMode;
+    },
+    getDrawnPath () {
+      return drawnPath;
+    },
+    setDrawnPath (dp) {
+      drawnPath = dp;
+      return drawnPath;
+    },
+    getSVGRoot
+  }
+);
+
+// Interface strings, usually for title elements
+const uiStrings = {};
+
+const visElems = 'a,circle,ellipse,foreignObject,g,image,line,path,polygon,polyline,rect,svg,text,tspan,use';
+const refAttrs = ['clip-path', 'fill', 'filter', 'marker-end', 'marker-mid', 'marker-start', 'mask', 'stroke'];
+
+const elData = $.data;
+
+// Animation element to change the opacity of any newly created element
+const opacAni = document.createElementNS(NS.SVG, 'animate');
+$(opacAni).attr({
+  attributeName: 'opacity',
+  begin: 'indefinite',
+  dur: 1,
+  fill: 'freeze'
+}).appendTo(this.svgroot);
+
+const restoreRefElems = function (elem) {
+  // Look for missing reference elements, restore any found
+  const attrs = $(elem).attr(refAttrs);
+  Object.values(attrs).forEach((val) => {
+    if (val && val.startsWith('url(')) {
+      const id = getUrlFromAttr(val).substr(1);
+      const ref = getElem(id);
+      if (!ref) {
+        findDefs().append(removedElements[id]);
+        delete removedElements[id];
+      }
+    }
+  });
+
+  const childs = elem.getElementsByTagName('*');
+
+  if (childs.length) {
+    for (let i = 0, l = childs.length; i < l; i++) {
+      restoreRefElems(childs[i]);
+    }
+  }
+};
+
+// (function () {
+// TODO For Issue 208: this is a start on a thumbnail
+//  const svgthumb = svgdoc.createElementNS(NS.SVG, 'use');
+//  svgthumb.setAttribute('width', '100');
+//  svgthumb.setAttribute('height', '100');
+//  setHref(svgthumb, '#svgcontent');
+//  svgroot.append(svgthumb);
+// }());
+
+/**
+ * @typedef {PlainObject} module:svgcanvas.SaveOptions
+ * @property {boolean} apply
+ * @property {"embed"} [image]
+ * @property {Integer} round_digits
+ */
+
+// Object to contain image data for raster images that were found encodable
+const encodableImages = {},
+
+  // Object with save options
+  /**
+   * @type {module:svgcanvas.SaveOptions}
+   */
+  saveOptions = {round_digits: 5},
+
+  // Object with IDs for imported files, to see if one was already added
+  importIds = {},
+
+  // Current text style properties
+  curText = allProperties.text,
+
+  // Object to contain all included extensions
+  extensions = {},
+
+  // Map of deleted reference elements
+  removedElements = {};
+
+let
+  // String with image URL of last loadable image
+  lastGoodImgUrl = curConfig.imgPath + 'logo.png',
+
+  // Boolean indicating whether or not a draw action has been started
+  started = false,
+
+  // String with an element's initial transform attribute value
+  startTransform = null,
+
+  // String indicating the current editor mode
+  currentMode = 'select',
+
+  // String with the current direction in which an element is being resized
+  currentResizeMode = 'none',
+
+  // Current general properties
+  curProperties = curShape,
+
+  // Array with selected elements' Bounding box object
+  // selectedBBoxes = new Array(1),
+
+  // The DOM element that was just selected
+  justSelected = null,
+
+  // DOM element for selection rectangle drawn by the user
+  rubberBox = null,
+
+  // Array of current BBoxes, used in getIntersectionList().
+  curBBoxes = [],
+
+  // Canvas point for the most recent right click
+  lastClickPoint = null;
+
+/**
+* This method sends back an array or a NodeList full of elements that
+* intersect the multi-select rubber-band-box on the currentLayer only.
+*
+* We brute-force `getIntersectionList` for browsers that do not support it (Firefox).
+*
+* Reference:
+* Firefox does not implement `getIntersectionList()`, see {@link https://bugzilla.mozilla.org/show_bug.cgi?id=501421}.
+* @function module:svgcanvas.SvgCanvas#getIntersectionList
+* @param {SVGRect} rect
+* @returns {Element[]|NodeList} Bbox elements
+*/
+const getIntersectionList = this.getIntersectionList = function (rect) {
+  if (isNullish(rubberBox)) { return null; }
+
+  const parent = currentGroup || this.getCurrentDrawing().getCurrentLayer();
+
+  let rubberBBox;
+  if (!rect) {
+    rubberBBox = rubberBox.getBBox();
+    const bb = this.svgContent.createSVGRect();
+
+    ['x', 'y', 'width', 'height', 'top', 'right', 'bottom', 'left'].forEach((o) => {
+      bb[o] = rubberBBox[o] / currentZoom;
+    });
+    rubberBBox = bb;
+  } else {
+    rubberBBox = this.svgContent.createSVGRect();
+    rubberBBox.x = rect.x;
+    rubberBBox.y = rect.y;
+    rubberBBox.width = rect.width;
+    rubberBBox.height = rect.height;
+  }
+
+  let resultList = null;
+  if (!isIE()) {
+    if (typeof this.svgroot.getIntersectionList === 'function') {
+      // Offset the bbox of the rubber box by the offset of the svgcontent element.
+      rubberBBox.x += Number.parseInt(this.svgContent.getAttribute('x'));
+      rubberBBox.y += Number.parseInt(this.svgContent.getAttribute('y'));
+
+      resultList = this.svgroot.getIntersectionList(rubberBBox, parent);
+    }
+  }
+
+  if (isNullish(resultList) || typeof resultList.item !== 'function') {
+    resultList = [];
+
+    if (!curBBoxes.length) {
+      // Cache all bboxes
+      curBBoxes = getVisibleElementsAndBBoxes(parent);
+    }
+    let i = curBBoxes.length;
+    while (i--) {
+      if (!rubberBBox.width) { continue; }
+      if (rectsIntersect(rubberBBox, curBBoxes[i].bbox)) {
+        resultList.push(curBBoxes[i].elem);
+      }
+    }
+  }
+
+  // addToSelection expects an array, but it's ok to pass a NodeList
+  // because using square-bracket notation is allowed:
+  // https://www.w3.org/TR/DOM-Level-2-Core/ecma-script-binding.html
+  return resultList;
+};
+
+this.getStrokedBBox = getStrokedBBoxDefaultVisible;
+
+this.getVisibleElements = getVisibleElements;
+
+/**
+* @typedef {PlainObject} ElementAndBBox
+* @property {Element} elem - The element
+* @property {module:utilities.BBoxObject} bbox - The element's BBox as retrieved from `getStrokedBBoxDefaultVisible`
+*/
+
+/**
+* Get all elements that have a BBox (excludes `<defs>`, `<title>`, etc).
+* Note that 0-opacity, off-screen etc elements are still considered "visible"
+* for this function.
+* @function module:svgcanvas.SvgCanvas#getVisibleElementsAndBBoxes
+* @param {Element} parent - The parent DOM element to search within
+* @returns {ElementAndBBox[]} An array with objects that include:
+*/
+const getVisibleElementsAndBBoxes = this.getVisibleElementsAndBBoxes = function (parent) {
+  if (!parent) {
+    parent = $(svgcontent).children(); // Prevent layers from being included
+  }
+  const contentElems = [];
+  $(parent).children().each(function (i, elem) {
+    if (elem.getBBox) {
+      contentElems.push({elem, bbox: getStrokedBBoxDefaultVisible([elem])});
+    }
+  });
+  return contentElems.reverse();
+};
+
+/**
+* Wrap an SVG element into a group element, mark the group as 'gsvg'.
+* @function module:svgcanvas.SvgCanvas#groupSvgElem
+* @param {Element} elem - SVG element to wrap
+* @returns {void}
+*/
+const groupSvgElem = this.groupSvgElem = function (elem) {
+  const g = document.createElementNS(NS.SVG, 'g');
+  elem.replaceWith(g);
+  $(g).append(elem).data('gsvg', elem)[0].id = getNextId();
+};
+
+/**
+* Runs the SVG Document through the sanitizer and then updates its paths.
+* @function module:svgcanvas.SvgCanvas#prepareSvg
+* @param {XMLDocument} newDoc - The SVG DOM document
+* @returns {void}
+*/
+this.prepareSvg = function (newDoc) {
+  this.sanitizeSvg(newDoc.documentElement);
+
+  // convert paths into absolute commands
+  const paths = [...newDoc.getElementsByTagNameNS(NS.SVG, 'path')];
+  paths.forEach((path) => {
+    path.setAttribute('d', pathActions.convertPath(path));
+    pathActions.fixEnd(path);
+  });
+};
+
+/**
+* Hack for Firefox bugs where text element features aren't updated or get
+* messed up. See issue 136 and issue 137.
+* This function clones the element and re-selects it.
+* @function module:svgcanvas~ffClone
+* @todo Test for this bug on load and add it to "support" object instead of
+* browser sniffing
+* @param {Element} elem - The (text) DOM element to clone
+* @returns {Element} Cloned element
+*/
+const ffClone = function (elem) {
+  if (!isGecko()) { return elem; }
+  const clone = elem.cloneNode(true);
+  elem.before(clone);
+  elem.remove();
+  selectorManager.releaseSelector(elem);
+  selectedElements[0] = clone;
+  selectorManager.requestSelector(clone).showGrips(true);
+  return clone;
+};
+
+// `this.each` is deprecated, if any extension used this it can be recreated by doing this:
+// * @example $(canvas.getRootElem()).children().each(...)
+// * @function module:svgcanvas.SvgCanvas#each
+// this.each = function (cb) {
+//  $(svgroot).children().each(cb);
+// };
+
+/**
+* Removes any old rotations if present, prepends a new rotation at the
+* transformed center.
+* @function module:svgcanvas.SvgCanvas#setRotationAngle
+* @param {string|Float} val - The new rotation angle in degrees
+* @param {boolean} preventUndo - Indicates whether the action should be undoable or not
+* @fires module:svgcanvas.SvgCanvas#event:changed
+* @returns {void}
+*/
+this.setRotationAngle = function (val, preventUndo) {
+  // ensure val is the proper type
+  val = Number.parseFloat(val);
+  const elem = selectedElements[0];
+  const oldTransform = elem.getAttribute('transform');
+  const bbox = utilsGetBBox(elem);
+  const cx = bbox.x + bbox.width / 2, cy = bbox.y + bbox.height / 2;
+  const tlist = getTransformList(elem);
+
+  // only remove the real rotational transform if present (i.e. at index=0)
+  if (tlist.numberOfItems > 0) {
+    const xform = tlist.getItem(0);
+    if (xform.type === 4) {
+      tlist.removeItem(0);
+    }
+  }
+  // find Rnc and insert it
+  if (val !== 0) {
+    const center = transformPoint(cx, cy, transformListToTransform(tlist).matrix);
+    const Rnc = this.svgroot.createSVGTransform();
+    Rnc.setRotate(val, center.x, center.y);
+    if (tlist.numberOfItems) {
+      tlist.insertItemBefore(Rnc, 0);
+    } else {
+      tlist.appendItem(Rnc);
+    }
+  } else if (tlist.numberOfItems === 0) {
+    elem.removeAttribute('transform');
+  }
+
+  if (!preventUndo) {
+    // we need to undo it, then redo it so it can be undo-able! :)
+    // TODO: figure out how to make changes to transform list undo-able cross-browser?
+    const newTransform = elem.getAttribute('transform');
+    elem.setAttribute('transform', oldTransform);
+    changeSelectedAttribute('transform', newTransform, selectedElements);
+    call('changed', selectedElements);
+  }
+  // const pointGripContainer = getElem('pathpointgrip_container');
+  // if (elem.nodeName === 'path' && pointGripContainer) {
+  //   pathActions.setPointContainerTransform(elem.getAttribute('transform'));
+  // }
+  const selector = selectorManager.requestSelector(selectedElements[0]);
+  selector.resize();
+  Selector.updateGripCursors(val);
+};
+
+/**
+* Runs `recalculateDimensions` on the selected elements,
+* adding the changes to a single batch command.
+* @function module:svgcanvas.SvgCanvas#recalculateAllSelectedDimensions
+* @fires module:svgcanvas.SvgCanvas#event:changed
+* @returns {void}
+*/
+const recalculateAllSelectedDimensions = this.recalculateAllSelectedDimensions = function () {
+  const text = (currentResizeMode === 'none' ? 'position' : 'size');
+  const batchCmd = new BatchCommand(text);
+
+  let i = selectedElements.length;
+  while (i--) {
+    const elem = selectedElements[i];
+    // if (getRotationAngle(elem) && !hasMatrixTransform(getTransformList(elem))) { continue; }
+    const cmd = recalculateDimensions(elem);
+    if (cmd) {
+      batchCmd.addSubCommand(cmd);
+    }
+  }
+
+  if (!batchCmd.isEmpty()) {
+    addCommandToHistory(batchCmd);
+    call('changed', selectedElements);
+  }
+};
+
+/**
+ * Debug tool to easily see the current matrix in the browser's console.
+ * @function module:svgcanvas~logMatrix
+ * @param {SVGMatrix} m The matrix
+ * @returns {void}
+ */
+const logMatrix = function (m) {
+  console.log([m.a, m.b, m.c, m.d, m.e, m.f]); // eslint-disable-line no-console
+};
+
+// Root Current Transformation Matrix in user units
+let rootSctm = null;
+
+/**
+* Group: Selection.
+*/
+
+// TODO: do we need to worry about selectedBBoxes here?
+
+/**
+* Selects only the given elements, shortcut for `clearSelection(); addToSelection()`.
+* @function module:svgcanvas.SvgCanvas#selectOnly
+* @param {Element[]} elems - an array of DOM elements to be selected
+* @param {boolean} showGrips - Indicates whether the resize grips should be shown
+* @returns {void}
+*/
+const selectOnly = this.selectOnly = function (elems, showGrips) {
+  clearSelection(true);
+  addToSelection(elems, showGrips);
+};
+
+// TODO: could use slice here to make this faster?
+// TODO: should the 'selected' handler
+
+/**
+* Removes elements from the selection.
+* @function module:svgcanvas.SvgCanvas#removeFromSelection
+* @param {Element[]} elemsToRemove - An array of elements to remove from selection
+* @returns {void}
+*/
+/* const removeFromSelection = */ this.removeFromSelection = function (elemsToRemove) {
+  if (isNullish(selectedElements[0])) { return; }
+  if (!elemsToRemove.length) { return; }
+
+  // find every element and remove it from our array copy
+  const newSelectedItems = [],
+    len = selectedElements.length;
+  for (let i = 0; i < len; ++i) {
+    const elem = selectedElements[i];
+    if (elem) {
+      // keep the item
+      if (!elemsToRemove.includes(elem)) {
+        newSelectedItems.push(elem);
+      } else { // remove the item and its selector
+        selectorManager.releaseSelector(elem);
+      }
+    }
+  }
+  // the copy becomes the master now
+  selectedElements = newSelectedItems;
+};
+
+/**
+* Clears the selection, then adds all elements in the current layer to the selection.
+* @function module:svgcanvas.SvgCanvas#selectAllInCurrentLayer
+* @returns {void}
+*/
+this.selectAllInCurrentLayer = function () {
+  const currentLayer = getCurrentDrawing().getCurrentLayer();
+  if (currentLayer) {
+    currentMode = 'select';
+    selectOnly($(currentGroup || currentLayer).children());
+  }
+};
+
+let drawnPath = null;
+
+// Mouse events
+(function () {
+const freehand = {
+  minx: null,
+  miny: null,
+  maxx: null,
+  maxy: null
+};
+const THRESHOLD_DIST = 0.8,
+  STEP_COUNT = 10;
+let dAttr = null,
+  startX = null,
+  startY = null,
+  rStartX = null,
+  rStartY = null,
+  initBbox = {},
+  sumDistance = 0,
+  controllPoint2 = {x: 0, y: 0},
+  controllPoint1 = {x: 0, y: 0},
+  start = {x: 0, y: 0},
+  end = {x: 0, y: 0},
+  bSpline = {x: 0, y: 0},
+  nextPos = {x: 0, y: 0},
+  parameter,
+  nextParameter;
+
+const getBsplinePoint = function (t) {
+  const spline = {x: 0, y: 0},
+    p0 = controllPoint2,
+    p1 = controllPoint1,
+    p2 = start,
+    p3 = end,
+    S = 1.0 / 6.0,
+    t2 = t * t,
+    t3 = t2 * t;
+
+  const m = [
+    [-1, 3, -3, 1],
+    [3, -6, 3, 0],
+    [-3, 0, 3, 0],
+    [1, 4, 1, 0]
+  ];
+
+  spline.x = S * (
+    (p0.x * m[0][0] + p1.x * m[0][1] + p2.x * m[0][2] + p3.x * m[0][3]) * t3 +
+      (p0.x * m[1][0] + p1.x * m[1][1] + p2.x * m[1][2] + p3.x * m[1][3]) * t2 +
+      (p0.x * m[2][0] + p1.x * m[2][1] + p2.x * m[2][2] + p3.x * m[2][3]) * t +
+      (p0.x * m[3][0] + p1.x * m[3][1] + p2.x * m[3][2] + p3.x * m[3][3])
+  );
+  spline.y = S * (
+    (p0.y * m[0][0] + p1.y * m[0][1] + p2.y * m[0][2] + p3.y * m[0][3]) * t3 +
+      (p0.y * m[1][0] + p1.y * m[1][1] + p2.y * m[1][2] + p3.y * m[1][3]) * t2 +
+      (p0.y * m[2][0] + p1.y * m[2][1] + p2.y * m[2][2] + p3.y * m[2][3]) * t +
+      (p0.y * m[3][0] + p1.y * m[3][1] + p2.y * m[3][2] + p3.y * m[3][3])
+  );
+
+  return {
+    x: spline.x,
+    y: spline.y
+  };
+};
+
+/* eslint-disable jsdoc/require-property */
+/**
+* Group: Text edit functions
+* Functions relating to editing text elements.
+* @namespace {PlainObject} textActions
+* @memberof module:svgcanvas.SvgCanvas#
+*/
+const textActions = canvas.textActions = (function () {
+/* eslint-enable jsdoc/require-property */
+let curtext;
+let textinput;
+let cursor;
+let selblock;
+let blinker;
+let chardata = [];
+let textbb; // , transbb;
+let matrix;
+let lastX, lastY;
+let allowDbl;
+
+/**
+ *
+ * @param {Integer} index
+ * @returns {void}
+ */
+function setCursor (index) {
+  const empty = (textinput.value === '');
+  $(textinput).focus();
+
+  if (!arguments.length) {
+    if (empty) {
+      index = 0;
+    } else {
+      if (textinput.selectionEnd !== textinput.selectionStart) { return; }
+      index = textinput.selectionEnd;
+    }
+  }
+
+  const charbb = chardata[index];
+  if (!empty) {
+    textinput.setSelectionRange(index, index);
+  }
+  cursor = getElem('text_cursor');
+  if (!cursor) {
+    cursor = document.createElementNS(NS.SVG, 'line');
+    assignAttributes(cursor, {
+      id: 'text_cursor',
+      stroke: '#333',
+      'stroke-width': 1
+    });
+    cursor = getElem('selectorParentGroup').appendChild(cursor);
+  }
+
+  if (!blinker) {
+    blinker = setInterval(function () {
+      const show = (cursor.getAttribute('display') === 'none');
+      cursor.setAttribute('display', show ? 'inline' : 'none');
+    }, 600);
+  }
+
+  const startPt = ptToScreen(charbb.x, textbb.y);
+  const endPt = ptToScreen(charbb.x, (textbb.y + textbb.height));
+
+  assignAttributes(cursor, {
+    x1: startPt.x,
+    y1: startPt.y,
+    x2: endPt.x,
+    y2: endPt.y,
+    visibility: 'visible',
+    display: 'inline'
+  });
+
+  if (selblock) { selblock.setAttribute('d', ''); }
+}
+
+/**
+ *
+ * @param {Integer} start
+ * @param {Integer} end
+ * @param {boolean} skipInput
+ * @returns {void}
+ */
+function setSelection (start, end, skipInput) {
+  if (start === end) {
+    setCursor(end);
+    return;
+  }
+
+  if (!skipInput) {
+    textinput.setSelectionRange(start, end);
+  }
+
+  selblock = getElem('text_selectblock');
+  if (!selblock) {
+    selblock = document.createElementNS(NS.SVG, 'path');
+    assignAttributes(selblock, {
+      id: 'text_selectblock',
+      fill: 'green',
+      opacity: 0.5,
+      style: 'pointer-events:none'
+    });
+    getElem('selectorParentGroup').append(selblock);
+  }
+
+  const startbb = chardata[start];
+  const endbb = chardata[end];
+
+  cursor.setAttribute('visibility', 'hidden');
+
+  const tl = ptToScreen(startbb.x, textbb.y),
+    tr = ptToScreen(startbb.x + (endbb.x - startbb.x), textbb.y),
+    bl = ptToScreen(startbb.x, textbb.y + textbb.height),
+    br = ptToScreen(startbb.x + (endbb.x - startbb.x), textbb.y + textbb.height);
+
+  const dstr = 'M' + tl.x + ',' + tl.y +
+    ' L' + tr.x + ',' + tr.y +
+    ' ' + br.x + ',' + br.y +
+    ' ' + bl.x + ',' + bl.y + 'z';
+
+  assignAttributes(selblock, {
+    d: dstr,
+    display: 'inline'
+  });
+}
+
+/**
+ *
+ * @param {Float} mouseX
+ * @param {Float} mouseY
+ * @returns {Integer}
+ */
+function getIndexFromPoint (mouseX, mouseY) {
+  // Position cursor here
+  const pt = this.svgroot.createSVGPoint();
+  pt.x = mouseX;
+  pt.y = mouseY;
+
+  // No content, so return 0
+  if (chardata.length === 1) { return 0; }
+  // Determine if cursor should be on left or right of character
+  let charpos = curtext.getCharNumAtPosition(pt);
+  if (charpos < 0) {
+    // Out of text range, look at mouse coords
+    charpos = chardata.length - 2;
+    if (mouseX <= chardata[0].x) {
+      charpos = 0;
+    }
+  } else if (charpos >= chardata.length - 2) {
+    charpos = chardata.length - 2;
+  }
+  const charbb = chardata[charpos];
+  const mid = charbb.x + (charbb.width / 2);
+  if (mouseX > mid) {
+    charpos++;
+  }
+  return charpos;
+}
+
+/**
+ *
+ * @param {Float} mouseX
+ * @param {Float} mouseY
+ * @returns {void}
+ */
+function setCursorFromPoint (mouseX, mouseY) {
+  setCursor(getIndexFromPoint(mouseX, mouseY));
+}
+
+/**
+ *
+ * @param {Float} x
+ * @param {Float} y
+ * @param {boolean} apply
+ * @returns {void}
+ */
+function setEndSelectionFromPoint (x, y, apply) {
+  const i1 = textinput.selectionStart;
+  const i2 = getIndexFromPoint(x, y);
+
+  const start = Math.min(i1, i2);
+  const end = Math.max(i1, i2);
+  setSelection(start, end, !apply);
+}
+
+/**
+ *
+ * @param {Float} xIn
+ * @param {Float} yIn
+ * @returns {module:math.XYObject}
+ */
+function screenToPt (xIn, yIn) {
+  const out = {
+    x: xIn,
+    y: yIn
+  };
+
+  out.x /= currentZoom;
+  out.y /= currentZoom;
+
+  if (matrix) {
+    const pt = transformPoint(out.x, out.y, matrix.inverse());
+    out.x = pt.x;
+    out.y = pt.y;
+  }
+
+  return out;
+}
+
+/**
+ *
+ * @param {Float} xIn
+ * @param {Float} yIn
+ * @returns {module:math.XYObject}
+ */
+function ptToScreen (xIn, yIn) {
+  const out = {
+    x: xIn,
+    y: yIn
+  };
+
+  if (matrix) {
+    const pt = transformPoint(out.x, out.y, matrix);
+    out.x = pt.x;
+    out.y = pt.y;
+  }
+
+  out.x *= currentZoom;
+  out.y *= currentZoom;
+
+  return out;
+}
+
+/*
+// Not currently in use
+function hideCursor () {
+  if (cursor) {
+    cursor.setAttribute('visibility', 'hidden');
+  }
+}
+*/
+
+/**
+ *
+ * @param {Event} evt
+ * @returns {void}
+ */
+function selectAll (evt) {
+  setSelection(0, curtext.textContent.length);
+  $(this).unbind(evt);
+}
+
+/**
+ *
+ * @param {Event} evt
+ * @returns {void}
+ */
+function selectWord (evt) {
+  if (!allowDbl || !curtext) { return; }
+
+  const ept = transformPoint(evt.pageX, evt.pageY, rootSctm),
+    mouseX = ept.x * currentZoom,
+    mouseY = ept.y * currentZoom;
+  const pt = screenToPt(mouseX, mouseY);
+
+  const index = getIndexFromPoint(pt.x, pt.y);
+  const str = curtext.textContent;
+  const first = str.substr(0, index).replace(/[a-z\d]+$/i, '').length;
+  const m = str.substr(index).match(/^[a-z\d]+/i);
+  const last = (m ? m[0].length : 0) + index;
+  setSelection(first, last);
+
+  // Set tripleclick
+  $(evt.target).click(selectAll);
+  setTimeout(function () {
+    $(evt.target).unbind('click', selectAll);
+  }, 300);
+}
+
+return /** @lends module:svgcanvas.SvgCanvas#textActions */ {
+  /**
+  * @param {Element} target
+  * @param {Float} x
+  * @param {Float} y
+  * @returns {void}
+  */
+  select (target, x, y) {
+    curtext = target;
+    textActions.toEditMode(x, y);
+  },
+  /**
+  * @param {Element} elem
+  * @returns {void}
+  */
+  start (elem) {
+    curtext = elem;
+    textActions.toEditMode();
+  },
+  /**
+  * @param {external:MouseEvent} evt
+  * @param {Element} mouseTarget
+  * @param {Float} startX
+  * @param {Float} startY
+  * @returns {void}
+  */
+  mouseDown (evt, mouseTarget, startX, startY) {
+    const pt = screenToPt(startX, startY);
+
+    textinput.focus();
+    setCursorFromPoint(pt.x, pt.y);
+    lastX = startX;
+    lastY = startY;
+
+    // TODO: Find way to block native selection
+  },
+  /**
+  * @param {Float} mouseX
+  * @param {Float} mouseY
+  * @returns {void}
+  */
+  mouseMove (mouseX, mouseY) {
+    const pt = screenToPt(mouseX, mouseY);
+    setEndSelectionFromPoint(pt.x, pt.y);
+  },
+  /**
+  * @param {external:MouseEvent} evt
+  * @param {Float} mouseX
+  * @param {Float} mouseY
+  * @returns {void}
+  */
+  mouseUp (evt, mouseX, mouseY) {
+    const pt = screenToPt(mouseX, mouseY);
+
+    setEndSelectionFromPoint(pt.x, pt.y, true);
+
+    // TODO: Find a way to make this work: Use transformed BBox instead of evt.target
+    // if (lastX === mouseX && lastY === mouseY
+    //   && !rectsIntersect(transbb, {x: pt.x, y: pt.y, width: 0, height: 0})) {
+    //   textActions.toSelectMode(true);
+    // }
+
+    if (
+      evt.target !== curtext &&
+      mouseX < lastX + 2 &&
+      mouseX > lastX - 2 &&
+      mouseY < lastY + 2 &&
+      mouseY > lastY - 2
+    ) {
+      textActions.toSelectMode(true);
+    }
+  },
+  /**
+  * @function
+  * @param {Integer} index
+  * @returns {void}
+  */
+  setCursor,
+  /**
+  * @param {Float} x
+  * @param {Float} y
+  * @returns {void}
+  */
+  toEditMode (x, y) {
+    allowDbl = false;
+    currentMode = 'textedit';
+    selectorManager.requestSelector(curtext).showGrips(false);
+    // Make selector group accept clicks
+    /* const selector = */ selectorManager.requestSelector(curtext); // Do we need this? Has side effect of setting lock, so keeping for now, but next line wasn't being used
+    // const sel = selector.selectorRect;
+
+    textActions.init();
+
+    $(curtext).css('cursor', 'text');
+
+    // if (supportsEditableText()) {
+    //   curtext.setAttribute('editable', 'simple');
+    //   return;
+    // }
+
+    if (!arguments.length) {
+      setCursor();
+    } else {
+      const pt = screenToPt(x, y);
+      setCursorFromPoint(pt.x, pt.y);
+    }
+
+    setTimeout(function () {
+      allowDbl = true;
+    }, 300);
+  },
+  /**
+  * @param {boolean|Element} selectElem
+  * @fires module:svgcanvas.SvgCanvas#event:selected
+  * @returns {void}
+  */
+  toSelectMode (selectElem) {
+    currentMode = 'select';
+    clearInterval(blinker);
+    blinker = null;
+    if (selblock) { $(selblock).attr('display', 'none'); }
+    if (cursor) { $(cursor).attr('visibility', 'hidden'); }
+    $(curtext).css('cursor', 'move');
+
+    if (selectElem) {
+      clearSelection();
+      $(curtext).css('cursor', 'move');
+
+      call('selected', [curtext]);
+      addToSelection([curtext], true);
+    }
+    if (curtext && !curtext.textContent.length) {
+      // No content, so delete
+      canvas.deleteSelectedElements();
+    }
+
+    $(textinput).blur();
+
+    curtext = false;
+
+    // if (supportsEditableText()) {
+    //   curtext.removeAttribute('editable');
+    // }
+  },
+  /**
+  * @param {Element} elem
+  * @returns {void}
+  */
+  setInputElem (elem) {
+    textinput = elem;
+    // $(textinput).blur(hideCursor);
+  },
+  /**
+  * @returns {void}
+  */
+  clear () {
+    if (currentMode === 'textedit') {
+      textActions.toSelectMode();
+    }
+  },
+  /**
+  * @param {Element} inputElem Not in use
+  * @returns {void}
+  */
+  init (inputElem) {
+    if (!curtext) { return; }
+    let i, end;
+    // if (supportsEditableText()) {
+    //   curtext.select();
+    //   return;
+    // }
+
+    if (!curtext.parentNode) {
+      // Result of the ffClone, need to get correct element
+      curtext = selectedElements[0];
+      selectorManager.requestSelector(curtext).showGrips(false);
+    }
+
+    const str = curtext.textContent;
+    const len = str.length;
+
+    const xform = curtext.getAttribute('transform');
+
+    textbb = utilsGetBBox(curtext);
+
+    matrix = xform ? getMatrix(curtext) : null;
+
+    chardata = [];
+    chardata.length = len;
+    textinput.focus();
+
+    $(curtext).unbind('dblclick', selectWord).dblclick(selectWord);
+
+    if (!len) {
+      end = {x: textbb.x + (textbb.width / 2), width: 0};
+    }
+
+    for (i = 0; i < len; i++) {
+      const start = curtext.getStartPositionOfChar(i);
+      end = curtext.getEndPositionOfChar(i);
+
+      if (!supportsGoodTextCharPos()) {
+        const offset = canvas.contentW * currentZoom;
+        start.x -= offset;
+        end.x -= offset;
+
+        start.x /= currentZoom;
+        end.x /= currentZoom;
+      }
+
+      // Get a "bbox" equivalent for each character. Uses the
+      // bbox data of the actual text for y, height purposes
+
+      // TODO: Decide if y, width and height are actually necessary
+      chardata[i] = {
+        x: start.x,
+        y: textbb.y, // start.y?
+        width: end.x - start.x,
+        height: textbb.height
+      };
+    }
+
+    // Add a last bbox for cursor at end of text
+    chardata.push({
+      x: end.x,
+      width: 0
+    });
+    setSelection(textinput.selectionStart, textinput.selectionEnd, true);
+  }
+};
+}());
+
+/**
+* Group: Serialization.
+*/
+
+/**
+* Looks at DOM elements inside the `<defs>` to see if they are referred to,
+* removes them from the DOM if they are not.
+* @function module:svgcanvas.SvgCanvas#removeUnusedDefElems
+* @returns {Integer} The number of elements that were removed
+*/
+const removeUnusedDefElems = this.removeUnusedDefElems = function () {
+  const defs = this.svgContent.getElementsByTagNameNS(NS.SVG, 'defs');
+  if (!defs || !defs.length) { return 0; }
+
+  // if (!defs.firstChild) { return; }
+
+  const defelemUses = [];
+  let numRemoved = 0;
+  const attrs = ['fill', 'stroke', 'filter', 'marker-start', 'marker-mid', 'marker-end'];
+  const alen = attrs.length;
+
+  const allEls = this.svgContent.getElementsByTagNameNS(NS.SVG, '*');
+  const allLen = allEls.length;
+
+  let i, j;
+  for (i = 0; i < allLen; i++) {
+    const el = allEls[i];
+    for (j = 0; j < alen; j++) {
+      const ref = getUrlFromAttr(el.getAttribute(attrs[j]));
+      if (ref) {
+        defelemUses.push(ref.substr(1));
+      }
+    }
+
+    // gradients can refer to other gradients
+    const href = getHref(el);
+    if (href && href.startsWith('#')) {
+      defelemUses.push(href.substr(1));
+    }
+  }
+
+  const defelems = $(defs).find('linearGradient, radialGradient, filter, marker, svg, symbol');
+  i = defelems.length;
+  while (i--) {
+    const defelem = defelems[i];
+    const {id} = defelem;
+    if (!defelemUses.includes(id)) {
+      // Not found, so remove (but remember)
+      removedElements[id] = defelem;
+      defelem.remove();
+      numRemoved++;
+    }
+  }
+
+  return numRemoved;
+};
+
+/**
+* Main function to set up the SVG content for output.
+* @function module:svgcanvas.SvgCanvas#svgCanvasToString
+* @returns {string} The SVG image for output
+*/
+this.svgCanvasToString = function () {
+  // keep calling it until there are none to remove
+  while (removeUnusedDefElems() > 0) {} // eslint-disable-line no-empty
+
+  pathActions.clear(true);
+
+  // Keep SVG-Edit comment on top
+  $.each(this.svgContent.childNodes, function (i, node) {
+    if (i && node.nodeType === 8 && node.data.includes('Created with')) {
+      this.svgContent.firstChild.before(node);
+    }
+  });
+
+  // Move out of in-group editing mode
+  if (currentGroup) {
+    draw.leaveContext();
+    selectOnly([currentGroup]);
+  }
+
+  const nakedSvgs = [];
+
+  // Unwrap gsvg if it has no special attributes (only id and style)
+  $(svgcontent).find('g:data(gsvg)').each(function () {
+    const attrs = this.attributes;
+    let len = attrs.length;
+    for (let i = 0; i < len; i++) {
+      if (attrs[i].nodeName === 'id' || attrs[i].nodeName === 'style') {
+        len--;
+      }
+    }
+    // No significant attributes, so ungroup
+    if (len <= 0) {
+      const svg = this.firstChild;
+      nakedSvgs.push(svg);
+      $(this).replaceWith(svg);
+    }
+  });
+  const output = this.svgToString(svgcontent, 0);
+
+  // Rewrap gsvg
+  if (nakedSvgs.length) {
+    $(nakedSvgs).each(function () {
+      groupSvgElem(this);
+    });
+  }
+
+  return output;
+};
+
+/**
+* Sub function ran on each SVG element to convert it to a string as desired.
+* @function module:svgcanvas.SvgCanvas#svgToString
+* @param {Element} elem - The SVG element to convert
+* @param {Integer} indent - Number of spaces to indent this tag
+* @returns {string} The given element as an SVG tag
+*/
+this.svgToString = function (elem, indent) {
+  const out = [];
+  const unit = curConfig.baseUnit;
+  const unitRe = new RegExp('^-?[\\d\\.]+' + unit + '$');
+
+  if (elem) {
+    cleanupElement(elem);
+    const attrs = [...elem.attributes];
+    const childs = elem.childNodes;
+    attrs.sort((a, b) => {
+      return a.name > b.name ? -1 : 1;
+    });
+
+    for (let i = 0; i < indent; i++) { out.push(' '); }
+    out.push('<'); out.push(elem.nodeName);
+    if (elem.id === 'svgcontent') {
+      // Process root element separately
+      const res = getResolution();
+
+      const vb = '';
+      // TODO: Allow this by dividing all values by current baseVal
+      // Note that this also means we should properly deal with this on import
+      // if (curConfig.baseUnit !== 'px') {
+      //   const unit = curConfig.baseUnit;
+      //   const unitM = getTypeMap()[unit];
+      //   res.w = shortFloat(res.w / unitM);
+      //   res.h = shortFloat(res.h / unitM);
+      //   vb = ' viewBox="' + [0, 0, res.w, res.h].join(' ') + '"';
+      //   res.w += unit;
+      //   res.h += unit;
+      // }
+
+      if (unit !== 'px') {
+        res.w = convertUnit(res.w, unit) + unit;
+        res.h = convertUnit(res.h, unit) + unit;
+      }
+
+      out.push(' width="' + res.w + '" height="' + res.h + '"' + vb + ' xmlns="' + NS.SVG + '"');
+
+      const nsuris = {};
+
+      // Check elements for namespaces, add if found
+      $(elem).find('*').andSelf().each(function () {
+        // const el = this;
+        // for some elements have no attribute
+        const uri = this.namespaceURI;
+        if (uri && !nsuris[uri] && nsMap[uri] && nsMap[uri] !== 'xmlns' && nsMap[uri] !== 'xml') {
+          nsuris[uri] = true;
+          out.push(' xmlns:' + nsMap[uri] + '="' + uri + '"');
+        }
+
+        $.each(this.attributes, function (i, attr) {
+          const u = attr.namespaceURI;
+          if (u && !nsuris[u] && nsMap[u] !== 'xmlns' && nsMap[u] !== 'xml') {
+            nsuris[u] = true;
+            out.push(' xmlns:' + nsMap[u] + '="' + u + '"');
+          }
+        });
+      });
+
+      let i = attrs.length;
+      const attrNames = ['width', 'height', 'xmlns', 'x', 'y', 'viewBox', 'id', 'overflow'];
+      while (i--) {
+        const attr = attrs[i];
+        const attrVal = toXml(attr.value);
+
+        // Namespaces have already been dealt with, so skip
+        if (attr.nodeName.startsWith('xmlns:')) { continue; }
+
+        // only serialize attributes we don't use internally
+        if (attrVal !== '' && !attrNames.includes(attr.localName)) {
+          if (!attr.namespaceURI || nsMap[attr.namespaceURI]) {
+            out.push(' ');
+            out.push(attr.nodeName); out.push('="');
+            out.push(attrVal); out.push('"');
+          }
+        }
+      }
+    } else {
+      // Skip empty defs
+      if (elem.nodeName === 'defs' && !elem.firstChild) { return ''; }
+
+      const mozAttrs = ['-moz-math-font-style', '_moz-math-font-style'];
+      for (let i = attrs.length - 1; i >= 0; i--) {
+        const attr = attrs[i];
+        let attrVal = toXml(attr.value);
+        // remove bogus attributes added by Gecko
+        if (mozAttrs.includes(attr.localName)) { continue; }
+        if (attrVal === 'null') {
+          const styleName = attr.localName.replace(/-[a-z]/g, (s) => s[1].toUpperCase());
+          if (Object.prototype.hasOwnProperty.call(elem.style, styleName)) { continue; }
+        }
+        if (attrVal !== '') {
+          if (attrVal.startsWith('pointer-events')) { continue; }
+          if (attr.localName === 'class' && attrVal.startsWith('se_')) { continue; }
+          out.push(' ');
+          if (attr.localName === 'd') { attrVal = pathActions.convertPath(elem, true); }
+          if (!isNaN(attrVal)) {
+            attrVal = shortFloat(attrVal);
+          } else if (unitRe.test(attrVal)) {
+            attrVal = shortFloat(attrVal) + unit;
+          }
+
+          // Embed images when saving
+          if (saveOptions.apply &&
+            elem.nodeName === 'image' &&
+            attr.localName === 'href' &&
+            saveOptions.images &&
+            saveOptions.images === 'embed'
+          ) {
+            const img = encodableImages[attrVal];
+            if (img) { attrVal = img; }
+          }
+
+          // map various namespaces to our fixed namespace prefixes
+          // (the default xmlns attribute itself does not get a prefix)
+          if (!attr.namespaceURI || attr.namespaceURI === NS.SVG || nsMap[attr.namespaceURI]) {
+            out.push(attr.nodeName); out.push('="');
+            out.push(attrVal); out.push('"');
+          }
+        }
+      }
+    }
+
+    if (elem.hasChildNodes()) {
+      out.push('>');
+      indent++;
+      let bOneLine = false;
+
+      for (let i = 0; i < childs.length; i++) {
+        const child = childs.item(i);
+        switch (child.nodeType) {
+        case 1: // element node
+          out.push('\n');
+          out.push(this.svgToString(child, indent));
+          break;
+        case 3: { // text node
+          const str = child.nodeValue.replace(/^\s+|\s+$/g, '');
+          if (str !== '') {
+            bOneLine = true;
+            out.push(String(toXml(str)));
+          }
+          break;
+        } case 4: // cdata node
+          out.push('\n');
+          out.push(new Array(indent + 1).join(' '));
+          out.push('<![CDATA[');
+          out.push(child.nodeValue);
+          out.push(']]>');
+          break;
+        case 8: // comment
+          out.push('\n');
+          out.push(new Array(indent + 1).join(' '));
+          out.push('<!--');
+          out.push(child.data);
+          out.push('-->');
+          break;
+        } // switch on node type
+      }
+      indent--;
+      if (!bOneLine) {
+        out.push('\n');
+        for (let i = 0; i < indent; i++) { out.push(' '); }
+      }
+      out.push('</'); out.push(elem.nodeName); out.push('>');
+    } else {
+      out.push('/>');
+    }
+  }
+  return out.join('');
+}; // end svgToString()
+
+/**
+ * Function to run when image data is found.
+ * @callback module:svgcanvas.ImageEmbeddedCallback
+ * @param {string|false} result Data URL
+ * @returns {void}
+ */
+/**
+* Converts a given image file to a data URL when possible, then runs a given callback.
+* @function module:svgcanvas.SvgCanvas#embedImage
+* @param {string} src - The path/URL of the image
+* @returns {Promise<string|false>} Resolves to a Data URL (string|false)
+*/
+this.embedImage = function (src) {
+  // Todo: Remove this Promise in favor of making an async/await `Image.load` utility
+  return new Promise(function (resolve, reject) { // eslint-disable-line promise/avoid-new
+    // load in the image and once it's loaded, get the dimensions
+    $(new Image()).load(function (response, status, xhr) {
+      if (status === 'error') {
+        reject(new Error('Error loading image: ' + xhr.status + ' ' + xhr.statusText));
+        return;
+      }
+      // create a canvas the same size as the raster image
+      const cvs = document.createElement('canvas');
+      cvs.width = this.width;
+      cvs.height = this.height;
+      // load the raster image into the canvas
+      cvs.getContext('2d').drawImage(this, 0, 0);
+      // retrieve the data: URL
+      try {
+        let urldata = ';svgedit_url=' + encodeURIComponent(src);
+        urldata = cvs.toDataURL().replace(';base64', urldata + ';base64');
+        encodableImages[src] = urldata;
+      } catch (e) {
+        encodableImages[src] = false;
+      }
+      lastGoodImgUrl = src;
+      resolve(encodableImages[src]);
+    }).attr('src', src);
+  });
+};
+
+/**
+* Sets a given URL to be a "last good image" URL.
+* @function module:svgcanvas.SvgCanvas#setGoodImage
+* @param {string} val
+* @returns {void}
+*/
+this.setGoodImage = function (val) {
+  lastGoodImgUrl = val;
+};
+
+/**
+* Does nothing by default, handled by optional widget/extension.
+* @function module:svgcanvas.SvgCanvas#open
+* @returns {void}
+*/
+this.open = function () {
+  /* */
+};
+
+/**
+* Serializes the current drawing into SVG XML text and passes it to the 'saved' handler.
+* This function also includes the XML prolog. Clients of the `SvgCanvas` bind their save
+* function to the 'saved' event.
+* @function module:svgcanvas.SvgCanvas#save
+* @param {module:svgcanvas.SaveOptions} opts
+* @fires module:svgcanvas.SvgCanvas#event:saved
+* @returns {void}
+*/
+this.save = function (opts) {
+  // remove the selected outline before serializing
+  clearSelection();
+  // Update save options if provided
+  if (opts) { $.extend(saveOptions, opts); }
+  saveOptions.apply = true;
+
+  // no need for doctype, see https://jwatt.org/svg/authoring/#doctype-declaration
+  const str = this.svgCanvasToString();
+  call('saved', str);
+};
+
+/**
+* @typedef {PlainObject} module:svgcanvas.IssuesAndCodes
+* @property {string[]} issueCodes The locale-independent code names
+* @property {string[]} issues The localized descriptions
+*/
+
+/**
+* Codes only is useful for locale-independent detection.
+* @returns {module:svgcanvas.IssuesAndCodes}
+*/
+function getIssues () {
+  // remove the selected outline before serializing
+  clearSelection();
+
+  // Check for known CanVG issues
+  const issues = [];
+  const issueCodes = [];
+
+  // Selector and notice
+  const issueList = {
+    feGaussianBlur: uiStrings.exportNoBlur,
+    foreignObject: uiStrings.exportNoforeignObject,
+    '[stroke-dasharray]': uiStrings.exportNoDashArray
+  };
+  const content = $(svgcontent);
+
+  // Add font/text check if Canvas Text API is not implemented
+  if (!('font' in $('<canvas>')[0].getContext('2d'))) {
+    issueList.text = uiStrings.exportNoText;
+  }
+
+  $.each(issueList, function (sel, descr) {
+    if (content.find(sel).length) {
+      issueCodes.push(sel);
+      issues.push(descr);
+    }
+  });
+  return {issues, issueCodes};
+}
+
+let canvg;
+/**
+* @typedef {"feGaussianBlur"|"foreignObject"|"[stroke-dasharray]"|"text"} module:svgcanvas.IssueCode
+*/
+/**
+* @typedef {PlainObject} module:svgcanvas.ImageExportedResults
+* @property {string} datauri Contents as a Data URL
+* @property {string} bloburl May be the empty string
+* @property {string} svg The SVG contents as a string
+* @property {string[]} issues The localization messages of `issueCodes`
+* @property {module:svgcanvas.IssueCode[]} issueCodes CanVG issues found with the SVG
+* @property {"PNG"|"JPEG"|"BMP"|"WEBP"|"ICO"} type The chosen image type
+* @property {"image/png"|"image/jpeg"|"image/bmp"|"image/webp"} mimeType The image MIME type
+* @property {Float} quality A decimal between 0 and 1 (for use with JPEG or WEBP)
+* @property {string} exportWindowName A convenience for passing along a `window.name` to target a window on which the export could be added
+*/
+
+/**
+* Generates a PNG (or JPG, BMP, WEBP) Data URL based on the current image,
+* then calls "exported" with an object including the string, image
+* information, and any issues found.
+* @function module:svgcanvas.SvgCanvas#rasterExport
+* @param {"PNG"|"JPEG"|"BMP"|"WEBP"|"ICO"} [imgType="PNG"]
+* @param {Float} [quality] Between 0 and 1
+* @param {string} [exportWindowName]
+* @param {PlainObject} [opts]
+* @param {boolean} [opts.avoidEvent]
+* @fires module:svgcanvas.SvgCanvas#event:exported
+* @todo Confirm/fix ICO type
+* @returns {Promise<module:svgcanvas.ImageExportedResults>} Resolves to {@link module:svgcanvas.ImageExportedResults}
+*/
+this.rasterExport = async function (imgType, quality, exportWindowName, opts = {}) {
+  const type = imgType === 'ICO' ? 'BMP' : (imgType || 'PNG');
+  const mimeType = 'image/' + type.toLowerCase();
+  const {issues, issueCodes} = getIssues();
+  const svg = this.svgCanvasToString();
+
+  if (!canvg) {
+    ({canvg} = await importSetGlobal(curConfig.canvgPath + 'canvg.js', {
+      global: 'canvg'
+    }));
+  }
+  if (!$('#export_canvas').length) {
+    $('<canvas>', {id: 'export_canvas'}).hide().appendTo('body');
+  }
+  const c = $('#export_canvas')[0];
+  c.width = canvas.contentW;
+  c.height = canvas.contentH;
+
+  await canvg(c, svg);
+  // Todo: Make async/await utility in place of `toBlob`, so we can remove this constructor
+  return new Promise((resolve, reject) => { // eslint-disable-line promise/avoid-new
+    const dataURLType = type.toLowerCase();
+    const datauri = quality
+      ? c.toDataURL('image/' + dataURLType, quality)
+      : c.toDataURL('image/' + dataURLType);
+    let bloburl;
+    /**
+     * Called when `bloburl` is available for export.
+     * @returns {void}
+     */
+    function done () {
+      const obj = {
+        datauri, bloburl, svg, issues, issueCodes, type: imgType,
+        mimeType, quality, exportWindowName
+      };
+      if (!opts.avoidEvent) {
+        call('exported', obj);
+      }
+      resolve(obj);
+    }
+    if (c.toBlob) {
+      c.toBlob((blob) => {
+        bloburl = createObjectURL(blob);
+        done();
+      }, mimeType, quality);
+      return;
+    }
+    bloburl = dataURLToObjectURL(datauri);
+    done();
+  });
+};
+/**
+ * @external jsPDF
+ */
+/**
+ * @typedef {void|"save"|"arraybuffer"|"blob"|"datauristring"|"dataurlstring"|"dataurlnewwindow"|"datauri"|"dataurl"} external:jsPDF.OutputType
+ * @todo Newer version to add also allows these `outputType` values "bloburi"|"bloburl" which return strings, so document here and for `outputType` of `module:svgcanvas.PDFExportedResults` below if added
+*/
+/**
+* @typedef {PlainObject} module:svgcanvas.PDFExportedResults
+* @property {string} svg The SVG PDF output
+* @property {string|ArrayBuffer|Blob|window} output The output based on the `outputType`;
+* if `undefined`, "datauristring", "dataurlstring", "datauri",
+* or "dataurl", will be a string (`undefined` gives a document, while the others
+* build as Data URLs; "datauri" and "dataurl" change the location of the current page); if
+* "arraybuffer", will return `ArrayBuffer`; if "blob", returns a `Blob`;
+* if "dataurlnewwindow", will change the current page's location and return a string
+* if in Safari and no window object is found; otherwise opens in, and returns, a new `window`
+* object; if "save", will have the same return as "dataurlnewwindow" if
+* `navigator.getUserMedia` support is found without `URL.createObjectURL` support; otherwise
+* returns `undefined` but attempts to save
+* @property {external:jsPDF.OutputType} outputType
+* @property {string[]} issues The human-readable localization messages of corresponding `issueCodes`
+* @property {module:svgcanvas.IssueCode[]} issueCodes
+* @property {string} exportWindowName
+*/
+
+/**
+* Generates a PDF based on the current image, then calls "exportedPDF" with
+* an object including the string, the data URL, and any issues found.
+* @function module:svgcanvas.SvgCanvas#exportPDF
+* @param {string} [exportWindowName] Will also be used for the download file name here
+* @param {external:jsPDF.OutputType} [outputType="dataurlstring"]
+* @fires module:svgcanvas.SvgCanvas#event:exportedPDF
+* @returns {Promise<module:svgcanvas.PDFExportedResults>} Resolves to {@link module:svgcanvas.PDFExportedResults}
+*/
+this.exportPDF = async function (
+  exportWindowName,
+  outputType = isChrome() ? 'save' : undefined
+) {
+  if (!window.jsPDF) {
+    // Todo: Switch to `import()` when widely supported and available (also allow customization of path)
+    await importScript([
+      // We do not currently have these paths configurable as they are
+      //   currently global-only, so not Rolled-up
+      'jspdf/underscore-min.js',
+      // 'jspdf/jspdf.min.js',
+      '../../svgedit-myfix/editor/jspdf/jspdf-1.0.150.debug.js'
+    ]);
+
+    const modularVersion = !('svgEditor' in window) ||
+      !window.svgEditor ||
+      window.svgEditor.modules !== false;
+    // Todo: Switch to `import()` when widely supported and available (also allow customization of path)
+    await importScript(curConfig.jspdfPath + 'jspdf.plugin.svgToPdf.js', {
+      type: modularVersion
+        ? 'module'
+        : 'text/javascript'
+    });
+    // await importModule('jspdf/jspdf.plugin.svgToPdf.js');
+  }
+
+  const res = getResolution();
+  const orientation = res.w > res.h ? 'landscape' : 'portrait';
+  const unit = 'pt'; // curConfig.baseUnit; // We could use baseUnit, but that is presumably not intended for export purposes
+
+  // Todo: Give options to use predefined jsPDF formats like "a4", etc. from pull-down (with option to keep customizable)
+  const doc = jsPDF({
+    orientation,
+    unit,
+    format: [res.w, res.h]
+    // , compressPdf: true
+  });
+  const docTitle = getDocumentTitle();
+  doc.setProperties({
+    title: docTitle /* ,
+    subject: '',
+    author: '',
+    keywords: '',
+    creator: '' */
+  });
+  const {issues, issueCodes} = getIssues();
+  const svg = this.svgCanvasToString();
+  doc.addSVG(svg, 0, 0);
+
+  // doc.output('save'); // Works to open in a new
+  //  window; todo: configure this and other export
+  //  options to optionally work in this manner as
+  //  opposed to opening a new tab
+  outputType = outputType || 'dataurlstring';
+  const obj = {svg, issues, issueCodes, exportWindowName, outputType};
+  obj.output = doc.output(outputType, outputType === 'save' ? (exportWindowName || 'svg.pdf') : undefined);
+  call('exportedPDF', obj);
+  return obj;
+};
+
+/**
+* Returns the current drawing as raw SVG XML text.
+* @function module:svgcanvas.SvgCanvas#getSvgString
+* @returns {string} The current drawing as raw SVG XML text.
+*/
+this.getSvgString = function () {
+  saveOptions.apply = false;
+  return this.svgCanvasToString();
+};
+
+/**
+* This function determines whether to use a nonce in the prefix, when
+* generating IDs for future documents in SVG-Edit.
+* If you're controlling SVG-Edit externally, and want randomized IDs, call
+* this BEFORE calling `svgCanvas.setSvgString`.
+* @function module:svgcanvas.SvgCanvas#randomizeIds
+* @param {boolean} [enableRandomization] If true, adds a nonce to the prefix. Thus
+* `svgCanvas.randomizeIds() <==> svgCanvas.randomizeIds(true)`
+* @returns {void}
+*/
+this.randomizeIds = function (enableRandomization) {
+  if (arguments.length > 0 && enableRandomization === false) {
+    draw.randomizeIds(false, getCurrentDrawing());
+  } else {
+    draw.randomizeIds(true, getCurrentDrawing());
+  }
+};
+
+/**
+* Ensure each element has a unique ID.
+* @function module:svgcanvas.SvgCanvas#uniquifyElems
+* @param {Element} g - The parent element of the tree to give unique IDs
+* @returns {void}
+*/
+const uniquifyElems = this.uniquifyElems = function (g) {
+  const ids = {};
+  // TODO: Handle markers and connectors. These are not yet re-identified properly
+  // as their referring elements do not get remapped.
+  //
+  // <marker id='se_marker_end_svg_7'/>
+  // <polyline id='svg_7' se:connector='svg_1 svg_6' marker-end='url(#se_marker_end_svg_7)'/>
+  //
+  // Problem #1: if svg_1 gets renamed, we do not update the polyline's se:connector attribute
+  // Problem #2: if the polyline svg_7 gets renamed, we do not update the marker id nor the polyline's marker-end attribute
+  const refElems = ['filter', 'linearGradient', 'pattern', 'radialGradient', 'symbol', 'textPath', 'use'];
+
+  walkTree(g, function (n) {
+    // if it's an element node
+    if (n.nodeType === 1) {
+      // and the element has an ID
+      if (n.id) {
+        // and we haven't tracked this ID yet
+        if (!(n.id in ids)) {
+          // add this id to our map
+          ids[n.id] = {elem: null, attrs: [], hrefs: []};
+        }
+        ids[n.id].elem = n;
+      }
+
+      // now search for all attributes on this element that might refer
+      // to other elements
+      $.each(refAttrs, function (i, attr) {
+        const attrnode = n.getAttributeNode(attr);
+        if (attrnode) {
+          // the incoming file has been sanitized, so we should be able to safely just strip off the leading #
+          const url = getUrlFromAttr(attrnode.value),
+            refid = url ? url.substr(1) : null;
+          if (refid) {
+            if (!(refid in ids)) {
+              // add this id to our map
+              ids[refid] = {elem: null, attrs: [], hrefs: []};
+            }
+            ids[refid].attrs.push(attrnode);
+          }
+        }
+      });
+
+      // check xlink:href now
+      const href = getHref(n);
+      // TODO: what if an <image> or <a> element refers to an element internally?
+      if (href && refElems.includes(n.nodeName)) {
+        const refid = href.substr(1);
+        if (refid) {
+          if (!(refid in ids)) {
+            // add this id to our map
+            ids[refid] = {elem: null, attrs: [], hrefs: []};
+          }
+          ids[refid].hrefs.push(n);
+        }
+      }
+    }
+  });
+
+  // in ids, we now have a map of ids, elements and attributes, let's re-identify
+  for (const oldid in ids) {
+    if (!oldid) { continue; }
+    const {elem} = ids[oldid];
+    if (elem) {
+      const newid = getNextId();
+
+      // assign element its new id
+      elem.id = newid;
+
+      // remap all url() attributes
+      const {attrs} = ids[oldid];
+      let j = attrs.length;
+      while (j--) {
+        const attr = attrs[j];
+        attr.ownerElement.setAttribute(attr.name, 'url(#' + newid + ')');
+      }
+
+      // remap all href attributes
+      const hreffers = ids[oldid].hrefs;
+      let k = hreffers.length;
+      while (k--) {
+        const hreffer = hreffers[k];
+        setHref(hreffer, '#' + newid);
+      }
+    }
+  }
+};
+
+/**
+* Assigns reference data for each use element.
+* @function module:svgcanvas.SvgCanvas#setUseData
+* @param {Element} parent
+* @returns {void}
+*/
+const setUseData = this.setUseData = function (parent) {
+  let elems = $(parent);
+
+  if (parent.tagName !== 'use') {
+    elems = elems.find('use');
+  }
+
+  elems.each(function () {
+    const id = getHref(this).substr(1);
+    const refElem = getElem(id);
+    if (!refElem) { return; }
+    $(this).data('ref', refElem);
+    if (refElem.tagName === 'symbol' || refElem.tagName === 'svg') {
+      $(this).data('symbol', refElem).data('ref', refElem);
+    }
+  });
+};
+
+/**
+* Converts gradients from userSpaceOnUse to objectBoundingBox.
+* @function module:svgcanvas.SvgCanvas#convertGradients
+* @param {Element} elem
+* @returns {void}
+*/
+const convertGradients = this.convertGradients = function (elem) {
+  let elems = $(elem).find('linearGradient, radialGradient');
+  if (!elems.length && isWebkit()) {
+    // Bug in webkit prevents regular *Gradient selector search
+    elems = $(elem).find('*').filter(function () {
+      return (this.tagName.includes('Gradient'));
+    });
+  }
+
+  elems.each(function () {
+    const grad = this; // eslint-disable-line consistent-this
+    if ($(grad).attr('gradientUnits') === 'userSpaceOnUse') {
+      // TODO: Support more than one element with this ref by duplicating parent grad
+      const fillStrokeElems = $(svgcontent).find('[fill="url(#' + grad.id + ')"],[stroke="url(#' + grad.id + ')"]');
+      if (!fillStrokeElems.length) { return; }
+
+      // get object's bounding box
+      const bb = utilsGetBBox(fillStrokeElems[0]);
+
+      // This will occur if the element is inside a <defs> or a <symbol>,
+      // in which we shouldn't need to convert anyway.
+      if (!bb) { return; }
+
+      if (grad.tagName === 'linearGradient') {
+        const gCoords = $(grad).attr(['x1', 'y1', 'x2', 'y2']);
+
+        // If has transform, convert
+        const tlist = grad.gradientTransform.baseVal;
+        if (tlist && tlist.numberOfItems > 0) {
+          const m = transformListToTransform(tlist).matrix;
+          const pt1 = transformPoint(gCoords.x1, gCoords.y1, m);
+          const pt2 = transformPoint(gCoords.x2, gCoords.y2, m);
+
+          gCoords.x1 = pt1.x;
+          gCoords.y1 = pt1.y;
+          gCoords.x2 = pt2.x;
+          gCoords.y2 = pt2.y;
+          grad.removeAttribute('gradientTransform');
+        }
+
+        $(grad).attr({
+          x1: (gCoords.x1 - bb.x) / bb.width,
+          y1: (gCoords.y1 - bb.y) / bb.height,
+          x2: (gCoords.x2 - bb.x) / bb.width,
+          y2: (gCoords.y2 - bb.y) / bb.height
+        });
+        grad.removeAttribute('gradientUnits');
+      }
+      // else {
+      //   Note: radialGradient elements cannot be easily converted
+      //   because userSpaceOnUse will keep circular gradients, while
+      //   objectBoundingBox will x/y scale the gradient according to
+      //   its bbox.
+      //
+      //   For now we'll do nothing, though we should probably have
+      //   the gradient be updated as the element is moved, as
+      //   inkscape/illustrator do.
+      //
+      //   const gCoords = $(grad).attr(['cx', 'cy', 'r']);
+      //
+      //   $(grad).attr({
+      //     cx: (gCoords.cx - bb.x) / bb.width,
+      //     cy: (gCoords.cy - bb.y) / bb.height,
+      //     r: gCoords.r
+      //   });
+      //
+      //   grad.removeAttribute('gradientUnits');
+      // }
+    }
+  });
+};
+
+/**
+* Converts selected/given `<use>` or child SVG element to a group.
+* @function module:svgcanvas.SvgCanvas#convertToGroup
+* @param {Element} elem
+* @fires module:svgcanvas.SvgCanvas#event:selected
+* @returns {void}
+*/
+const convertToGroup = this.convertToGroup = function (elem) {
+  if (!elem) {
+    elem = selectedElements[0];
+  }
+  const $elem = $(elem);
+  const batchCmd = new BatchCommand();
+  let ts;
+
+  if ($elem.data('gsvg')) {
+    // Use the gsvg as the new group
+    const svg = elem.firstChild;
+    const pt = $(svg).attr(['x', 'y']);
+
+    $(elem.firstChild.firstChild).unwrap();
+    $(elem).removeData('gsvg');
+
+    const tlist = getTransformList(elem);
+    const xform = this.svgroot.createSVGTransform();
+    xform.setTranslate(pt.x, pt.y);
+    tlist.appendItem(xform);
+    recalculateDimensions(elem);
+    call('selected', [elem]);
+  } else if ($elem.data('symbol')) {
+    elem = $elem.data('symbol');
+
+    ts = $elem.attr('transform');
+    const pos = $elem.attr(['x', 'y']);
+
+    const vb = elem.getAttribute('viewBox');
+
+    if (vb) {
+      const nums = vb.split(' ');
+      pos.x -= Number(nums[0]);
+      pos.y -= Number(nums[1]);
+    }
+
+    // Not ideal, but works
+    ts += ' translate(' + (pos.x || 0) + ',' + (pos.y || 0) + ')';
+
+    const prev = $elem.prev();
+
+    // Remove <use> element
+    batchCmd.addSubCommand(new RemoveElementCommand($elem[0], $elem[0].nextSibling, $elem[0].parentNode));
+    $elem.remove();
+
+    // See if other elements reference this symbol
+    const hasMore = $(svgcontent).find('use:data(symbol)').length;
+
+    const g = this.svgdoc.createElementNS(NS.SVG, 'g');
+    const childs = elem.childNodes;
+
+    let i;
+    for (i = 0; i < childs.length; i++) {
+      g.append(childs[i].cloneNode(true));
+    }
+
+    // Duplicate the gradients for Gecko, since they weren't included in the <symbol>
+    if (isGecko()) {
+      const dupeGrads = $(findDefs()).children('linearGradient,radialGradient,pattern').clone();
+      $(g).append(dupeGrads);
+    }
+
+    if (ts) {
+      g.setAttribute('transform', ts);
+    }
+
+    const parent = elem.parentNode;
+
+    uniquifyElems(g);
+
+    // Put the dupe gradients back into <defs> (after uniquifying them)
+    if (isGecko()) {
+      $(findDefs()).append($(g).find('linearGradient,radialGradient,pattern'));
+    }
+
+    // now give the g itself a new id
+    g.id = getNextId();
+
+    prev.after(g);
+
+    if (parent) {
+      if (!hasMore) {
+        // remove symbol/svg element
+        const {nextSibling} = elem;
+        elem.remove();
+        batchCmd.addSubCommand(new RemoveElementCommand(elem, nextSibling, parent));
+      }
+      batchCmd.addSubCommand(new InsertElementCommand(g));
+    }
+
+    setUseData(g);
+
+    if (isGecko()) {
+      convertGradients(findDefs());
+    } else {
+      convertGradients(g);
+    }
+
+    // recalculate dimensions on the top-level children so that unnecessary transforms
+    // are removed
+    walkTreePost(g, function (n) {
+      try {
+        recalculateDimensions(n);
+      } catch (e) {
+        console.log(e); // eslint-disable-line no-console
+      }
+    });
+
+    // Give ID for any visible element missing one
+    $(g).find(visElems).each(function () {
+      if (!this.id) { this.id = getNextId(); }
+    });
+
+    selectOnly([g]);
+
+    const cm = pushGroupProperties(g, true);
+    if (cm) {
+      batchCmd.addSubCommand(cm);
+    }
+
+    addCommandToHistory(batchCmd);
+  } else {
+    console.log('Unexpected element to ungroup:', elem); // eslint-disable-line no-console
+  }
+};
+
+/**
+* This function sets the current drawing as the input SVG XML.
+* @function module:svgcanvas.SvgCanvas#setSvgString
+* @param {string} xmlString - The SVG as XML text.
+* @param {boolean} [preventUndo=false] - Indicates if we want to do the
+* changes without adding them to the undo stack - e.g. for initializing a
+* drawing on page load.
+* @fires module:svgcanvas.SvgCanvas#event:setnonce
+* @fires module:svgcanvas.SvgCanvas#event:unsetnonce
+* @fires module:svgcanvas.SvgCanvas#event:changed
+* @returns {boolean} This function returns `false` if the set was
+*     unsuccessful, `true` otherwise.
+*/
+this.setSvgString = function (xmlString, preventUndo) {
+  try {
+    // convert string into XML document
+    const newDoc = text2xml(xmlString);
+    if (newDoc.firstElementChild &&
+      newDoc.firstElementChild.namespaceURI !== NS.SVG) {
+      return false;
+    }
+
+    this.prepareSvg(newDoc);
+
+    const batchCmd = new BatchCommand('Change Source');
+
+    // remove old svg document
+    const {nextSibling} = svgcontent;
+
+    this.svgContent.remove();
+    const oldzoom = svgcontent;
+    batchCmd.addSubCommand(new RemoveElementCommand(oldzoom, nextSibling, this.svgroot));
+
+    // set new svg document
+    // If DOM3 adoptNode() available, use it. Otherwise fall back to DOM2 importNode()
+    if (this.svgdoc.adoptNode) {
+      svgcontent = this.svgdoc.adoptNode(newDoc.documentElement);
+    } else {
+      svgcontent = this.svgdoc.importNode(newDoc.documentElement, true);
+    }
+
+    this.svgroot.append(svgcontent);
+    const content = $(svgcontent);
+
+    canvas.current_drawing_ = new draw.Drawing(svgcontent, idprefix);
+
+    // retrieve or set the nonce
+    const nonce = getCurrentDrawing().getNonce();
+    if (nonce) {
+      call('setnonce', nonce);
+    } else {
+      call('unsetnonce');
+    }
+
+    // change image href vals if possible
+    content.find('image').each(function () {
+      const image = this; // eslint-disable-line consistent-this
+      preventClickDefault(image);
+      const val = getHref(this);
+      if (val) {
+        if (val.startsWith('data:')) {
+          // Check if an SVG-edit data URI
+          const m = val.match(/svgedit_url=(.*?);/);
+          // const m = val.match(/svgedit_url=(?<url>.*?);/);
+          if (m) {
+            const url = decodeURIComponent(m[1]);
+            // const url = decodeURIComponent(m.groups.url);
+            $(new Image()).load(function () {
+              image.setAttributeNS(NS.XLINK, 'xlink:href', url);
+            }).attr('src', url);
+          }
+        }
+        // Add to encodableImages if it loads
+        canvas.embedImage(val);
+      }
+    });
+
+    // Wrap child SVGs in group elements
+    content.find('svg').each(function () {
+      // Skip if it's in a <defs>
+      if ($(this).closest('defs').length) { return; }
+
+      uniquifyElems(this);
+
+      // Check if it already has a gsvg group
+      const pa = this.parentNode;
+      if (pa.childNodes.length === 1 && pa.nodeName === 'g') {
+        $(pa).data('gsvg', this);
+        pa.id = pa.id || getNextId();
+      } else {
+        groupSvgElem(this);
+      }
+    });
+
+    // For Firefox: Put all paint elems in defs
+    if (isGecko()) {
+      content.find('linearGradient, radialGradient, pattern').appendTo(findDefs());
+    }
+
+    // Set ref element for <use> elements
+
+    // TODO: This should also be done if the object is re-added through "redo"
+    setUseData(content);
+
+    convertGradients(content[0]);
+
+    const attrs = {
+      id: 'svgcontent',
+      overflow: curConfig.show_outside_canvas ? 'visible' : 'hidden'
+    };
+
+    let percs = false;
+
+    // determine proper size
+    if (content.attr('viewBox')) {
+      const vb = content.attr('viewBox').split(' ');
+      attrs.width = vb[2];
+      attrs.height = vb[3];
+    // handle content that doesn't have a viewBox
+    } else {
+      $.each(['width', 'height'], function (i, dim) {
+        // Set to 100 if not given
+        const val = content.attr(dim) || '100%';
+
+        if (String(val).substr(-1) === '%') {
+          // Use user units if percentage given
+          percs = true;
+        } else {
+          attrs[dim] = convertToNum(dim, val);
+        }
+      });
+    }
+
+    // identify layers
+    draw.identifyLayers();
+
+    // Give ID for any visible layer children missing one
+    content.children().find(visElems).each(function () {
+      if (!this.id) { this.id = getNextId(); }
+    });
+
+    // Percentage width/height, so let's base it on visible elements
+    if (percs) {
+      const bb = getStrokedBBoxDefaultVisible();
+      attrs.width = bb.width + bb.x;
+      attrs.height = bb.height + bb.y;
+    }
+
+    // Just in case negative numbers are given or
+    // result from the percs calculation
+    if (attrs.width <= 0) { attrs.width = 100; }
+    if (attrs.height <= 0) { attrs.height = 100; }
+
+    content.attr(attrs);
+    this.contentW = attrs.width;
+    this.contentH = attrs.height;
+
+    batchCmd.addSubCommand(new InsertElementCommand(svgcontent));
+    // update root to the correct size
+    const changes = content.attr(['width', 'height']);
+    batchCmd.addSubCommand(new ChangeElementCommand(this.svgroot, changes));
+
+    // reset zoom
+    currentZoom = 1;
+
+    // reset transform lists
+    resetListMap();
+    clearSelection();
+    pathModule.clearData();
+    this.svgroot.append(selectorManager.selectorParentGroup);
+
+    if (!preventUndo) addCommandToHistory(batchCmd);
+    call('changed', [svgcontent]);
+  } catch (e) {
+    console.log(e); // eslint-disable-line no-console
+    return false;
+  }
+
+  return true;
+};
+
+/**
+* This function imports the input SVG XML as a `<symbol>` in the `<defs>`, then adds a
+* `<use>` to the current layer.
+* @function module:svgcanvas.SvgCanvas#importSvgString
+* @param {string} xmlString - The SVG as XML text.
+* @fires module:svgcanvas.SvgCanvas#event:changed
+* @returns {null|Element} This function returns null if the import was unsuccessful, or the element otherwise.
+* @todo
+* - properly handle if namespace is introduced by imported content (must add to svgcontent
+* and update all prefixes in the imported node)
+* - properly handle recalculating dimensions, `recalculateDimensions()` doesn't handle
+* arbitrary transform lists, but makes some assumptions about how the transform list
+* was obtained
+*/
+this.importSvgString = function (xmlString) {
+  let j, ts, useEl;
+  try {
+    // Get unique ID
+    const uid = encode64(xmlString.length + xmlString).substr(0, 32);
+
+    let useExisting = false;
+    // Look for symbol and make sure symbol exists in image
+    if (importIds[uid]) {
+      if ($(importIds[uid].symbol).parents('#svgroot').length) {
+        useExisting = true;
+      }
+    }
+
+    const batchCmd = new BatchCommand('Import Image');
+    let symbol;
+    if (useExisting) {
+      ({symbol} = importIds[uid]);
+      ts = importIds[uid].xform;
+    } else {
+      // convert string into XML document
+      const newDoc = text2xml(xmlString);
+
+      this.prepareSvg(newDoc);
+
+      // import new svg document into our document
+      let svg;
+      // If DOM3 adoptNode() available, use it. Otherwise fall back to DOM2 importNode()
+      if (this.svgdoc.adoptNode) {
+        svg = this.svgdoc.adoptNode(newDoc.documentElement);
+      } else {
+        svg = this.svgdoc.importNode(newDoc.documentElement, true);
+      }
+
+      uniquifyElems(svg);
+
+      const innerw = convertToNum('width', svg.getAttribute('width')),
+        innerh = convertToNum('height', svg.getAttribute('height')),
+        innervb = svg.getAttribute('viewBox'),
+        // if no explicit viewbox, create one out of the width and height
+        vb = innervb ? innervb.split(' ') : [0, 0, innerw, innerh];
+      for (j = 0; j < 4; ++j) {
+        vb[j] = Number(vb[j]);
+      }
+
+      // TODO: properly handle preserveAspectRatio
+      const // canvasw = +this.svgContent.getAttribute('width'),
+        canvash = Number(this.svgContent.getAttribute('height'));
+      // imported content should be 1/3 of the canvas on its largest dimension
+
+      if (innerh > innerw) {
+        ts = 'scale(' + (canvash / 3) / vb[3] + ')';
+      } else {
+        ts = 'scale(' + (canvash / 3) / vb[2] + ')';
+      }
+
+      // Hack to make recalculateDimensions understand how to scale
+      ts = 'translate(0) ' + ts + ' translate(0)';
+
+      symbol = this.svgdoc.createElementNS(NS.SVG, 'symbol');
+      const defs = findDefs();
+
+      if (isGecko()) {
+        // Move all gradients into root for Firefox, workaround for this bug:
+        // https://bugzilla.mozilla.org/show_bug.cgi?id=353575
+        // TODO: Make this properly undo-able.
+        $(svg).find('linearGradient, radialGradient, pattern').appendTo(defs);
+      }
+
+      while (svg.firstChild) {
+        const first = svg.firstChild;
+        symbol.append(first);
+      }
+      const attrs = svg.attributes;
+      for (const attr of attrs) { // Ok for `NamedNodeMap`
+        symbol.setAttribute(attr.nodeName, attr.value);
+      }
+      symbol.id = getNextId();
+
+      // Store data
+      importIds[uid] = {
+        symbol,
+        xform: ts
+      };
+
+      findDefs().append(symbol);
+      batchCmd.addSubCommand(new InsertElementCommand(symbol));
+    }
+
+    useEl = this.svgdoc.createElementNS(NS.SVG, 'use');
+    useEl.id = getNextId();
+    setHref(useEl, '#' + symbol.id);
+
+    (currentGroup || getCurrentDrawing().getCurrentLayer()).append(useEl);
+    batchCmd.addSubCommand(new InsertElementCommand(useEl));
+    clearSelection();
+
+    useEl.setAttribute('transform', ts);
+    recalculateDimensions(useEl);
+    $(useEl).data('symbol', symbol).data('ref', symbol);
+    addToSelection([useEl]);
+
+    // TODO: Find way to add this in a recalculateDimensions-parsable way
+    // if (vb[0] !== 0 || vb[1] !== 0) {
+    //   ts = 'translate(' + (-vb[0]) + ',' + (-vb[1]) + ') ' + ts;
+    // }
+    addCommandToHistory(batchCmd);
+    call('changed', [svgcontent]);
+  } catch (e) {
+    console.log(e); // eslint-disable-line no-console
+    return null;
+  }
+
+  // we want to return the element so we can automatically select it
+  return useEl;
+};
+
+// Could deprecate, but besides external uses, their usage makes clear that
+//  canvas is a dependency for all of these
+const dr = {
+  identifyLayers, createLayer, cloneLayer, deleteCurrentLayer,
+  setCurrentLayer, renameCurrentLayer, setCurrentLayerPosition,
+  setLayerVisibility, moveSelectedToLayer, mergeLayer, mergeAllLayers,
+  leaveContext, setContext
+};
+Object.entries(dr).forEach(([prop, propVal]) => {
+  canvas[prop] = propVal;
+});
+draw.init(
+  /**
+  * @implements {module:draw.DrawCanvasInit}
+  */
+  {
+    pathActions,
+    getCurrentGroup () {
+      return currentGroup;
+    },
+    setCurrentGroup (cg) {
+      currentGroup = cg;
+    },
+    getSelectedElements,
+    getSVGContent,
+    undoMgr,
+    elData,
+    getCurrentDrawing,
+    clearSelection,
+    call,
+    addCommandToHistory,
+    /**
+     * @fires module:svgcanvas.SvgCanvas#event:changed
+     * @returns {void}
+     */
+    changeSVGContent () {
+      call('changed', [svgcontent]);
+    }
+  }
+);
+
+/**
+* Group: Document functions.
+*/
+
+/**
+* Clears the current document. This is not an undoable action.
+* @function module:svgcanvas.SvgCanvas#clear
+* @fires module:svgcanvas.SvgCanvas#event:cleared
+* @returns {void}
+*/
+this.clear = function () {
+  pathActions.clear();
+
+  clearSelection();
+
+  // clear the svgcontent node
+  canvas.clearSvgContentElement();
+
+  // create new document
+  canvas.current_drawing_ = new draw.Drawing(svgcontent);
+
+  // create empty first layer
+  canvas.createLayer('Layer 1');
+
+  // clear the undo stack
+  canvas.undoMgr.resetUndoStack();
+
+  // reset the selector manager
+  selectorManager.initGroup();
+
+  // reset the rubber band box
+  rubberBox = selectorManager.getRubberBandBox();
+
+  call('cleared');
+};
+
+// Alias function
+this.linkControlPoints = pathActions.linkControlPoints;
+
+/**
+* @function module:svgcanvas.SvgCanvas#getContentElem
+* @returns {Element} The content DOM element
+*/
+this.getContentElem = function () { return svgcontent; };
+
+/**
+* @function module:svgcanvas.SvgCanvas#getRootElem
+* @returns {SVGSVGElement} The root DOM element
+*/
+this.getRootElem = function () { return this.svgroot; };
+
+/**
+* @typedef {PlainObject} DimensionsAndZoom
+* @property {Float} w Width
+* @property {Float} h Height
+* @property {Float} zoom Zoom
+*/
+
+/**
+* @function module:svgcanvas.SvgCanvas#getResolution
+* @returns {DimensionsAndZoom} The current dimensions and zoom level in an object
+*/
+const getResolution = this.getResolution = function () {
+//    const vb = this.svgContent.getAttribute('viewBox').split(' ');
+//    return {w:vb[2], h:vb[3], zoom: currentZoom};
+
+  const w = this.svgContent.getAttribute('width') / currentZoom;
+  const h = this.svgContent.getAttribute('height') / currentZoom;
+
+  return {
+    w,
+    h,
+    zoom: currentZoom
+  };
+};
+
+/**
+* @function module:svgcanvas.SvgCanvas#getSnapToGrid
+* @returns {boolean} The current snap to grid setting
+*/
+this.getSnapToGrid = function () { return curConfig.gridSnapping; };
+
+/**
+* @function module:svgcanvas.SvgCanvas#getVersion
+* @returns {string} A string which describes the revision number of SvgCanvas.
+*/
+this.getVersion = function () {
+  return 'svgcanvas.js ($Rev$)';
+};
+
+/**
+* Update interface strings with given values.
+* @function module:svgcanvas.SvgCanvas#setUiStrings
+* @param {module:path.uiStrings} strs - Object with strings (see the [locales API]{@link module:locale.LocaleStrings} and the [tutorial]{@tutorial LocaleDocs})
+* @returns {void}
+*/
+this.setUiStrings = function (strs) {
+  Object.assign(uiStrings, strs.notification);
+  $ = jQueryPluginDBox($, strs.common);
+  pathModule.setUiStrings(strs);
+};
+
+/**
+* Update configuration options with given values.
+* @function module:svgcanvas.SvgCanvas#setConfig
+* @param {module:SVGEditor.Config} opts - Object with options
+* @returns {void}
+*/
+this.setConfig = function (opts) {
+  Object.assign(curConfig, opts);
+};
+
+/**
+* @function module:svgcanvas.SvgCanvas#getTitle
+* @param {Element} [elem]
+* @returns {string|void} the current group/SVG's title contents or
+* `undefined` if no element is passed nd there are no selected elements.
+*/
+this.getTitle = function (elem) {
+  elem = elem || selectedElements[0];
+  if (!elem) { return undefined; }
+  elem = $(elem).data('gsvg') || $(elem).data('symbol') || elem;
+  const childs = elem.childNodes;
+  for (const child of childs) {
+    if (child.nodeName === 'title') {
+      return child.textContent;
+    }
+  }
+  return '';
+};
+
+/**
+* Sets the group/SVG's title content.
+* @function module:svgcanvas.SvgCanvas#setGroupTitle
+* @param {string} val
+* @todo Combine this with `setDocumentTitle`
+* @returns {void}
+*/
+this.setGroupTitle = function (val) {
+  let elem = selectedElements[0];
+  elem = $(elem).data('gsvg') || elem;
+
+  const ts = $(elem).children('title');
+
+  const batchCmd = new BatchCommand('Set Label');
+
+  let title;
+  if (!val.length) {
+    // Remove title element
+    const tsNextSibling = ts.nextSibling;
+    batchCmd.addSubCommand(new RemoveElementCommand(ts[0], tsNextSibling, elem));
+    ts.remove();
+  } else if (ts.length) {
+    // Change title contents
+    title = ts[0];
+    batchCmd.addSubCommand(new ChangeElementCommand(title, {'#text': title.textContent}));
+    title.textContent = val;
+  } else {
+    // Add title element
+    title = this.svgdoc.createElementNS(NS.SVG, 'title');
+    title.textContent = val;
+    $(elem).prepend(title);
+    batchCmd.addSubCommand(new InsertElementCommand(title));
+  }
+
+  addCommandToHistory(batchCmd);
+};
+
+/**
+* @function module:svgcanvas.SvgCanvas#getDocumentTitle
+* @returns {string|void} The current document title or an empty string if not found
+*/
+const getDocumentTitle = this.getDocumentTitle = function () {
+  return canvas.getTitle(svgcontent);
+};
+
+/**
+* Adds/updates a title element for the document with the given name.
+* This is an undoable action.
+* @function module:svgcanvas.SvgCanvas#setDocumentTitle
+* @param {string} newTitle - String with the new title
+* @returns {void}
+*/
+this.setDocumentTitle = function (newTitle) {
+  const childs = this.svgContent.childNodes;
+  let docTitle = false, oldTitle = '';
+
+  const batchCmd = new BatchCommand('Change Image Title');
+
+  for (const child of childs) {
+    if (child.nodeName === 'title') {
+      docTitle = child;
+      oldTitle = docTitle.textContent;
+      break;
+    }
+  }
+  if (!docTitle) {
+    docTitle = this.svgdoc.createElementNS(NS.SVG, 'title');
+    this.svgContent.insertBefore(docTitle, this.svgContent.firstChild);
+    // this.svgContent.firstChild.before(docTitle); // Ok to replace above with this?
+  }
+
+  if (newTitle.length) {
+    docTitle.textContent = newTitle;
+  } else {
+    // No title given, so element is not necessary
+    docTitle.remove();
+  }
+  batchCmd.addSubCommand(new ChangeElementCommand(docTitle, {'#text': oldTitle}));
+  addCommandToHistory(batchCmd);
+};
+
+/**
+* Returns the editor's namespace URL, optionally adding it to the root element.
+* @function module:svgcanvas.SvgCanvas#getEditorNS
+* @param {boolean} [add] - Indicates whether or not to add the namespace value
+* @returns {string} The editor's namespace URL
+*/
+this.getEditorNS = function (add) {
+  if (add) {
+    this.svgContent.setAttribute('xmlns:se', NS.SE);
+  }
+  return NS.SE;
+};
+
+/**
+* Changes the document's dimensions to the given size.
+* @function module:svgcanvas.SvgCanvas#setResolution
+* @param {Float|"fit"} x - Number with the width of the new dimensions in user units.
+* Can also be the string "fit" to indicate "fit to content".
+* @param {Float} y - Number with the height of the new dimensions in user units.
+* @fires module:svgcanvas.SvgCanvas#event:changed
+* @returns {boolean} Indicates if resolution change was successful.
+* It will fail on "fit to content" option with no content to fit to.
+*/
+this.setResolution = function (x, y) {
+  const res = getResolution();
+  const {w, h} = res;
+  let batchCmd;
+
+  if (x === 'fit') {
+    // Get bounding box
+    const bbox = getStrokedBBoxDefaultVisible();
+
+    if (bbox) {
+      batchCmd = new BatchCommand('Fit Canvas to Content');
+      const visEls = getVisibleElements();
+      addToSelection(visEls);
+      const dx = [], dy = [];
+      $.each(visEls, function (i, item) {
+        dx.push(bbox.x * -1);
+        dy.push(bbox.y * -1);
+      });
+
+      const cmd = canvas.moveSelectedElements(dx, dy, true);
+      batchCmd.addSubCommand(cmd);
+      clearSelection();
+
+      x = Math.round(bbox.width);
+      y = Math.round(bbox.height);
+    } else {
+      return false;
+    }
+  }
+  if (x !== w || y !== h) {
+    if (!batchCmd) {
+      batchCmd = new BatchCommand('Change Image Dimensions');
+    }
+
+    x = convertToNum('width', x);
+    y = convertToNum('height', y);
+
+    this.svgContent.setAttribute('width', x);
+    this.svgContent.setAttribute('height', y);
+
+    this.contentW = x;
+    this.contentH = y;
+    batchCmd.addSubCommand(new ChangeElementCommand(svgcontent, {width: w, height: h}));
+
+    this.svgContent.setAttribute('viewBox', [0, 0, x / currentZoom, y / currentZoom].join(' '));
+    batchCmd.addSubCommand(new ChangeElementCommand(svgcontent, {viewBox: ['0 0', w, h].join(' ')}));
+
+    addCommandToHistory(batchCmd);
+    call('changed', [svgcontent]);
+  }
+  return true;
+};
+
+/**
+* @typedef {module:jQueryAttr.Attributes} module:svgcanvas.ElementPositionInCanvas
+* @property {Float} x
+* @property {Float} y
+*/
+
+/**
+* @function module:svgcanvas.SvgCanvas#getOffset
+* @returns {module:svgcanvas.ElementPositionInCanvas} An object with `x`, `y` values indicating the svgcontent element's
+* position in the editor's canvas.
+*/
+this.getOffset = function () {
+  return $(svgcontent).attr(['x', 'y']);
+};
+
+/**
+ * @typedef {PlainObject} module:svgcanvas.ZoomAndBBox
+ * @property {Float} zoom
+ * @property {module:utilities.BBoxObject} bbox
+ */
+/**
+* Sets the zoom level on the canvas-side based on the given value.
+* @function module:svgcanvas.SvgCanvas#setBBoxZoom
+* @param {"selection"|"canvas"|"content"|"layer"|module:SVGEditor.BBoxObjectWithFactor} val - Bounding box object to zoom to or string indicating zoom option. Note: the object value type is defined in `svg-editor.js`
+* @param {Integer} editorW - The editor's workarea box's width
+* @param {Integer} editorH - The editor's workarea box's height
+* @returns {module:svgcanvas.ZoomAndBBox|void}
+*/
+this.setBBoxZoom = function (val, editorW, editorH) {
+  let spacer = 0.85;
+  let bb;
+  const calcZoom = function (bb) { // eslint-disable-line no-shadow
+    if (!bb) { return false; }
+    const wZoom = Math.round((editorW / bb.width) * 100 * spacer) / 100;
+    const hZoom = Math.round((editorH / bb.height) * 100 * spacer) / 100;
+    const zoom = Math.min(wZoom, hZoom);
+    canvas.setZoom(zoom);
+    return {zoom, bbox: bb};
+  };
+
+  if (typeof val === 'object') {
+    bb = val;
+    if (bb.width === 0 || bb.height === 0) {
+      const newzoom = bb.zoom ? bb.zoom : currentZoom * bb.factor;
+      canvas.setZoom(newzoom);
+      return {zoom: currentZoom, bbox: bb};
+    }
+    return calcZoom(bb);
+  }
+
+  switch (val) {
+  case 'selection': {
+    if (!selectedElements[0]) { return undefined; }
+    const selectedElems = $.map(selectedElements, function (n) {
+      if (n) {
+        return n;
+      }
+      return undefined;
+    });
+    bb = getStrokedBBoxDefaultVisible(selectedElems);
+    break;
+  } case 'canvas': {
+    const res = getResolution();
+    spacer = 0.95;
+    bb = {width: res.w, height: res.h, x: 0, y: 0};
+    break;
+  } case 'content':
+    bb = getStrokedBBoxDefaultVisible();
+    break;
+  case 'layer':
+    bb = getStrokedBBoxDefaultVisible(getVisibleElements(getCurrentDrawing().getCurrentLayer()));
+    break;
+  default:
+    return undefined;
+  }
+  return calcZoom(bb);
+};
+
+/**
+* The zoom level has changed. Supplies the new zoom level as a number (not percentage).
+* @event module:svgcanvas.SvgCanvas#event:ext_zoomChanged
+* @type {Float}
+*/
+/**
+* The bottom panel was updated.
+* @event module:svgcanvas.SvgCanvas#event:ext_toolButtonStateUpdate
+* @type {PlainObject}
+* @property {boolean} nofill Indicates fill is disabled
+* @property {boolean} nostroke Indicates stroke is disabled
+*/
+/**
+* The element selection has changed (elements were added/removed from selection).
+* @event module:svgcanvas.SvgCanvas#event:ext_selectedChanged
+* @type {PlainObject}
+* @property {Element[]} elems Array of the newly selected elements
+* @property {Element|null} selectedElement The single selected element
+* @property {boolean} multiselected Indicates whether one or more elements were selected
+*/
+/**
+* Called when part of element is in process of changing, generally on
+* mousemove actions like rotate, move, etc.
+* @event module:svgcanvas.SvgCanvas#event:ext_elementTransition
+* @type {PlainObject}
+* @property {Element[]} elems Array of transitioning elements
+*/
+/**
+* One or more elements were changed.
+* @event module:svgcanvas.SvgCanvas#event:ext_elementChanged
+* @type {PlainObject}
+* @property {Element[]} elems Array of the affected elements
+*/
+/**
+* Invoked as soon as the locale is ready.
+* @event module:svgcanvas.SvgCanvas#event:ext_langReady
+* @type {PlainObject}
+* @property {string} lang The two-letter language code
+* @property {module:SVGEditor.uiStrings} uiStrings
+* @property {module:SVGEditor~ImportLocale} importLocale
+*/
+/**
+* The language was changed. Two-letter code of the new language.
+* @event module:svgcanvas.SvgCanvas#event:ext_langChanged
+* @type {string}
+*/
+/**
+* Means for an extension to add locale data. The two-letter language code.
+* @event module:svgcanvas.SvgCanvas#event:ext_addLangData
+* @type {PlainObject}
+* @property {string} lang
+* @property {module:SVGEditor~ImportLocale} importLocale
+*/
+/**
+ * Called when new image is created.
+ * @event module:svgcanvas.SvgCanvas#event:ext_onNewDocument
+ * @type {void}
+ */
+/**
+ * Called when sidepanel is resized or toggled.
+ * @event module:svgcanvas.SvgCanvas#event:ext_workareaResized
+ * @type {void}
+*/
+/**
+ * Called upon addition of the extension, or, if svgicons are set,
+ * after the icons are ready when extension SVG icons have loaded.
+ * @event module:svgcanvas.SvgCanvas#event:ext_callback
+ * @type {void}
+*/
+
+/**
+* Sets the zoom to the given level.
+* @function module:svgcanvas.SvgCanvas#setZoom
+* @param {Float} zoomLevel - Float indicating the zoom level to change to
+* @fires module:svgcanvas.SvgCanvas#event:ext_zoomChanged
+* @returns {void}
+*/
+this.setZoom = function (zoomLevel) {
+  const res = getResolution();
+  this.svgContent.setAttribute('viewBox', '0 0 ' + res.w / zoomLevel + ' ' + res.h / zoomLevel);
+  currentZoom = zoomLevel;
+  $.each(selectedElements, function (i, elem) {
+    if (!elem) { return; }
+    selectorManager.requestSelector(elem).resize();
+  });
+  pathActions.zoomChange();
+  runExtensions('zoomChanged', /** @type {module:svgcanvas.SvgCanvas#event:ext_zoomChanged} */ zoomLevel);
+};
+
+/**
+* @function module:svgcanvas.SvgCanvas#getMode
+* @returns {string} The current editor mode string
+*/
+this.getMode = function () {
+  return currentMode;
+};
+
+/**
+* Sets the editor's mode to the given string.
+* @function module:svgcanvas.SvgCanvas#setMode
+* @param {string} name - String with the new mode to change to
+* @returns {void}
+*/
+this.setMode = function (name) {
+  pathActions.clear(true);
+  textActions.clear();
+  curProperties = (selectedElements[0] && selectedElements[0].nodeName === 'text') ? curText : curShape;
+  currentMode = name;
+};
+
+/**
+* Group: Element Styling.
+*/
+
+/**
+* @typedef {PlainObject} module:svgcanvas.PaintOptions
+* @property {"solidColor"} type
+*/
+
+/**
+* @function module:svgcanvas.SvgCanvas#getColor
+* @param {string} type
+* @returns {string|module:svgcanvas.PaintOptions|Float|module:jGraduate~Paint} The current fill/stroke option
+*/
+this.getColor = function (type) {
+  return curProperties[type];
+};
+
+/**
+* Change the current stroke/fill color/gradient value.
+* @function module:svgcanvas.SvgCanvas#setColor
+* @param {string} type - String indicating fill or stroke
+* @param {string} val - The value to set the stroke attribute to
+* @param {boolean} preventUndo - Boolean indicating whether or not this should be an undoable option
+* @fires module:svgcanvas.SvgCanvas#event:changed
+* @returns {void}
+*/
+this.setColor = function (type, val, preventUndo) {
+  curShape[type] = val;
+  curProperties[type + '_paint'] = {type: 'solidColor'};
+  const elems = [];
+  /**
+   *
+   * @param {Element} e
+   * @returns {void}
+   */
+  function addNonG (e) {
+    if (e.nodeName !== 'g') {
+      elems.push(e);
+    }
+  }
+  let i = selectedElements.length;
+  while (i--) {
+    const elem = selectedElements[i];
+    if (elem) {
+      if (elem.tagName === 'g') {
+        walkTree(elem, addNonG);
+      } else if (type === 'fill') {
+        if (elem.tagName !== 'polyline' && elem.tagName !== 'line') {
+          elems.push(elem);
+        }
+      } else {
+        elems.push(elem);
+      }
+    }
+  }
+  if (elems.length > 0) {
+    if (!preventUndo) {
+      changeSelectedAttribute(type, val, elems);
+      call('changed', elems);
+    } else {
+      changeSelectedAttributeNoUndo(type, val, elems);
+    }
+  }
+};
+
+/**
+* Apply the current gradient to selected element's fill or stroke.
+* @function module:svgcanvas.SvgCanvas#setGradient
+* @param {"fill"|"stroke"} type - String indicating "fill" or "stroke" to apply to an element
+* @returns {void}
+*/
+const setGradient = this.setGradient = function (type) {
+  if (!curProperties[type + '_paint'] || curProperties[type + '_paint'].type === 'solidColor') { return; }
+  let grad = canvas[type + 'Grad'];
+  // find out if there is a duplicate gradient already in the defs
+  const duplicateGrad = findDuplicateGradient(grad);
+  const defs = findDefs();
+  // no duplicate found, so import gradient into defs
+  if (!duplicateGrad) {
+    // const origGrad = grad;
+    grad = defs.appendChild(this.svgdoc.importNode(grad, true));
+    // get next id and set it on the grad
+    grad.id = getNextId();
+  } else { // use existing gradient
+    grad = duplicateGrad;
+  }
+  canvas.setColor(type, 'url(#' + grad.id + ')');
+};
+
+/**
+* Check if exact gradient already exists.
+* @function module:svgcanvas~findDuplicateGradient
+* @param {SVGGradientElement} grad - The gradient DOM element to compare to others
+* @returns {SVGGradientElement} The existing gradient if found, `null` if not
+*/
+const findDuplicateGradient = function (grad) {
+  const defs = findDefs();
+  const existingGrads = $(defs).find('linearGradient, radialGradient');
+  let i = existingGrads.length;
+  const radAttrs = ['r', 'cx', 'cy', 'fx', 'fy'];
+  while (i--) {
+    const og = existingGrads[i];
+    if (grad.tagName === 'linearGradient') {
+      if (grad.getAttribute('x1') !== og.getAttribute('x1') ||
+        grad.getAttribute('y1') !== og.getAttribute('y1') ||
+        grad.getAttribute('x2') !== og.getAttribute('x2') ||
+        grad.getAttribute('y2') !== og.getAttribute('y2')
+      ) {
+        continue;
+      }
+    } else {
+      const gradAttrs = $(grad).attr(radAttrs);
+      const ogAttrs = $(og).attr(radAttrs);
+
+      let diff = false;
+      $.each(radAttrs, function (j, attr) {
+        if (gradAttrs[attr] !== ogAttrs[attr]) { diff = true; }
+      });
+
+      if (diff) { continue; }
+    }
+
+    // else could be a duplicate, iterate through stops
+    const stops = grad.getElementsByTagNameNS(NS.SVG, 'stop');
+    const ostops = og.getElementsByTagNameNS(NS.SVG, 'stop');
+
+    if (stops.length !== ostops.length) {
+      continue;
+    }
+
+    let j = stops.length;
+    while (j--) {
+      const stop = stops[j];
+      const ostop = ostops[j];
+
+      if (stop.getAttribute('offset') !== ostop.getAttribute('offset') ||
+        stop.getAttribute('stop-opacity') !== ostop.getAttribute('stop-opacity') ||
+        stop.getAttribute('stop-color') !== ostop.getAttribute('stop-color')) {
+        break;
+      }
+    }
+
+    if (j === -1) {
+      return og;
+    }
+  } // for each gradient in defs
+
+  return null;
+};
+
+/**
+* Set a color/gradient to a fill/stroke.
+* @function module:svgcanvas.SvgCanvas#setPaint
+* @param {"fill"|"stroke"} type - String with "fill" or "stroke"
+* @param {module:jGraduate.jGraduatePaintOptions} paint - The jGraduate paint object to apply
+* @returns {void}
+*/
+this.setPaint = function (type, paint) {
+  // make a copy
+  const p = new $.jGraduate.Paint(paint);
+  this.setPaintOpacity(type, p.alpha / 100, true);
+
+  // now set the current paint object
+  curProperties[type + '_paint'] = p;
+  switch (p.type) {
+  case 'solidColor':
+    this.setColor(type, p.solidColor !== 'none' ? '#' + p.solidColor : 'none');
+    break;
+  case 'linearGradient':
+  case 'radialGradient':
+    canvas[type + 'Grad'] = p[p.type];
+    setGradient(type);
+    break;
+  }
+};
+
+/**
+* @function module:svgcanvas.SvgCanvas#setStrokePaint
+* @param {module:jGraduate~Paint} paint
+* @returns {void}
+*/
+this.setStrokePaint = function (paint) {
+  this.setPaint('stroke', paint);
+};
+
+/**
+* @function module:svgcanvas.SvgCanvas#setFillPaint
+* @param {module:jGraduate~Paint} paint
+* @returns {void}
+*/
+this.setFillPaint = function (paint) {
+  this.setPaint('fill', paint);
+};
+
+/**
+* @function module:svgcanvas.SvgCanvas#getStrokeWidth
+* @returns {Float|string} The current stroke-width value
+*/
+this.getStrokeWidth = function () {
+  return curProperties.stroke_width;
+};
+
+/**
+* Sets the stroke width for the current selected elements.
+* When attempting to set a line's width to 0, this changes it to 1 instead.
+* @function module:svgcanvas.SvgCanvas#setStrokeWidth
+* @param {Float} val - A Float indicating the new stroke width value
+* @fires module:svgcanvas.SvgCanvas#event:changed
+* @returns {void}
+*/
+this.setStrokeWidth = function (val) {
+  if (val === 0 && ['line', 'path'].includes(currentMode)) {
+    canvas.setStrokeWidth(1);
+    return;
+  }
+  curProperties.stroke_width = val;
+
+  const elems = [];
+  /**
+   *
+   * @param {Element} e
+   * @returns {void}
+   */
+  function addNonG (e) {
+    if (e.nodeName !== 'g') {
+      elems.push(e);
+    }
+  }
+  let i = selectedElements.length;
+  while (i--) {
+    const elem = selectedElements[i];
+    if (elem) {
+      if (elem.tagName === 'g') {
+        walkTree(elem, addNonG);
+      } else {
+        elems.push(elem);
+      }
+    }
+  }
+  if (elems.length > 0) {
+    changeSelectedAttribute('stroke-width', val, elems);
+    call('changed', selectedElements);
+  }
+};
+
+/**
+* Set the given stroke-related attribute the given value for selected elements.
+* @function module:svgcanvas.SvgCanvas#setStrokeAttr
+* @param {string} attr - String with the attribute name
+* @param {string|Float} val - String or number with the attribute value
+* @fires module:svgcanvas.SvgCanvas#event:changed
+* @returns {void}
+*/
+this.setStrokeAttr = function (attr, val) {
+  curShape[attr.replace('-', '_')] = val;
+  const elems = [];
+
+  let i = selectedElements.length;
+  while (i--) {
+    const elem = selectedElements[i];
+    if (elem) {
+      if (elem.tagName === 'g') {
+        walkTree(elem, function (e) { if (e.nodeName !== 'g') { elems.push(e); } });
+      } else {
+        elems.push(elem);
+      }
+    }
+  }
+  if (elems.length > 0) {
+    changeSelectedAttribute(attr, val, elems);
+    call('changed', selectedElements);
+  }
+};
+
+/**
+* @typedef {PlainObject} module:svgcanvas.StyleOptions
+* @property {string} fill
+* @property {Float} fill_opacity
+* @property {string} stroke
+* @property {Float} stroke_width
+* @property {string} stroke_dasharray
+* @property {string} stroke_linejoin
+* @property {string} stroke_linecap
+* @property {Float} stroke_opacity
+* @property {Float} opacity
+*/
+
+/**
+* @function module:svgcanvas.SvgCanvas#getStyle
+* @returns {module:svgcanvas.StyleOptions} current style options
+*/
+this.getStyle = function () {
+  return curShape;
+};
+
+/**
+* @function module:svgcanvas.SvgCanvas#getOpacity
+* @returns {Float} the current opacity
+*/
+this.getOpacity = getOpacity;
+
+/**
+* Sets the given opacity on the current selected elements.
+* @function module:svgcanvas.SvgCanvas#setOpacity
+* @param {string} val
+* @returns {void}
+*/
+this.setOpacity = function (val) {
+  curShape.opacity = val;
+  changeSelectedAttribute('opacity', val);
+};
+
+/**
+* @function module:svgcanvas.SvgCanvas#getFillOpacity
+* @returns {Float} the current fill opacity
+*/
+this.getFillOpacity = function () {
+  return curShape.fill_opacity;
+};
+
+/**
+* @function module:svgcanvas.SvgCanvas#getStrokeOpacity
+* @returns {string} the current stroke opacity
+*/
+this.getStrokeOpacity = function () {
+  return curShape.stroke_opacity;
+};
+
+/**
+* Sets the current fill/stroke opacity.
+* @function module:svgcanvas.SvgCanvas#setPaintOpacity
+* @param {string} type - String with "fill" or "stroke"
+* @param {Float} val - Float with the new opacity value
+* @param {boolean} preventUndo - Indicates whether or not this should be an undoable action
+* @returns {void}
+*/
+this.setPaintOpacity = function (type, val, preventUndo) {
+  curShape[type + '_opacity'] = val;
+  if (!preventUndo) {
+    changeSelectedAttribute(type + '-opacity', val);
+  } else {
+    changeSelectedAttributeNoUndo(type + '-opacity', val);
+  }
+};
+
+/**
+* Gets the current fill/stroke opacity.
+* @function module:svgcanvas.SvgCanvas#getPaintOpacity
+* @param {"fill"|"stroke"} type - String with "fill" or "stroke"
+* @returns {Float} Fill/stroke opacity
+*/
+this.getPaintOpacity = function (type) {
+  return type === 'fill' ? this.getFillOpacity() : this.getStrokeOpacity();
+};
+
+/**
+* Gets the `stdDeviation` blur value of the given element.
+* @function module:svgcanvas.SvgCanvas#getBlur
+* @param {Element} elem - The element to check the blur value for
+* @returns {string} stdDeviation blur attribute value
+*/
+this.getBlur = function (elem) {
+  let val = 0;
+  // const elem = selectedElements[0];
+
+  if (elem) {
+    const filterUrl = elem.getAttribute('filter');
+    if (filterUrl) {
+      const blur = getElem(elem.id + '_blur');
+      if (blur) {
+        val = blur.firstChild.getAttribute('stdDeviation');
+      }
+    }
+  }
+  return val;
+};
+
+(function () {
+let curCommand = null;
+let filter = null;
+let filterHidden = false;
+
+/**
+* Sets the `stdDeviation` blur value on the selected element without being undoable.
+* @function module:svgcanvas.SvgCanvas#setBlurNoUndo
+* @param {Float} val - The new `stdDeviation` value
+* @returns {void}
+*/
+canvas.setBlurNoUndo = function (val) {
+  if (!filter) {
+    canvas.setBlur(val);
+    return;
+  }
+  if (val === 0) {
+    // Don't change the StdDev, as that will hide the element.
+    // Instead, just remove the value for "filter"
+    changeSelectedAttributeNoUndo('filter', '');
+    filterHidden = true;
+  } else {
+    const elem = selectedElements[0];
+    if (filterHidden) {
+      changeSelectedAttributeNoUndo('filter', 'url(#' + elem.id + '_blur)');
+    }
+    if (isWebkit()) {
+      // console.log('e', elem); // eslint-disable-line no-console
+      elem.removeAttribute('filter');
+      elem.setAttribute('filter', 'url(#' + elem.id + '_blur)');
+    }
+    changeSelectedAttributeNoUndo('stdDeviation', val, [filter.firstChild]);
+    canvas.setBlurOffsets(filter, val);
+  }
+};
+
+/**
+ *
+ * @returns {void}
+ */
+function finishChange () {
+  const bCmd = canvas.undoMgr.finishUndoableChange();
+  curCommand.addSubCommand(bCmd);
+  addCommandToHistory(curCommand);
+  curCommand = null;
+  filter = null;
+}
+
+/**
+* Sets the `x`, `y`, `width`, `height` values of the filter element in order to
+* make the blur not be clipped. Removes them if not neeeded.
+* @function module:svgcanvas.SvgCanvas#setBlurOffsets
+* @param {Element} filterElem - The filter DOM element to update
+* @param {Float} stdDev - The standard deviation value on which to base the offset size
+* @returns {void}
+*/
+canvas.setBlurOffsets = function (filterElem, stdDev) {
+  if (stdDev > 3) {
+    // TODO: Create algorithm here where size is based on expected blur
+    assignAttributes(filterElem, {
+      x: '-50%',
+      y: '-50%',
+      width: '200%',
+      height: '200%'
+    }, 100);
+  // Removing these attributes hides text in Chrome (see Issue 579)
+  } else if (!isWebkit()) {
+      filterElem.removeAttribute('x');
+      filterElem.removeAttribute('y');
+      filterElem.removeAttribute('width');
+      filterElem.removeAttribute('height');
+  }
+};
+
+/**
+* Adds/updates the blur filter to the selected element.
+* @function module:svgcanvas.SvgCanvas#setBlur
+* @param {Float} val - Float with the new `stdDeviation` blur value
+* @param {boolean} complete - Whether or not the action should be completed (to add to the undo manager)
+* @returns {void}
+*/
+canvas.setBlur = function (val, complete) {
+  if (curCommand) {
+    finishChange();
+    return;
+  }
+
+  // Looks for associated blur, creates one if not found
+  const elem = selectedElements[0];
+  const elemId = elem.id;
+  filter = getElem(elemId + '_blur');
+
+  val -= 0;
+
+  const batchCmd = new BatchCommand();
+
+  // Blur found!
+  if (filter) {
+    if (val === 0) {
+      filter = null;
+    }
+  } else {
+    // Not found, so create
+    const newblur = addSVGElementFromJson({element: 'feGaussianBlur',
+      attr: {
+        in: 'SourceGraphic',
+        stdDeviation: val
+      }
+    });
+
+    filter = addSVGElementFromJson({element: 'filter',
+      attr: {
+        id: elemId + '_blur'
+      }
+    });
+
+    filter.append(newblur);
+    findDefs().append(filter);
+
+    batchCmd.addSubCommand(new InsertElementCommand(filter));
+  }
+
+  const changes = {filter: elem.getAttribute('filter')};
+
+  if (val === 0) {
+    elem.removeAttribute('filter');
+    batchCmd.addSubCommand(new ChangeElementCommand(elem, changes));
+    return;
+  }
+
+  changeSelectedAttribute('filter', 'url(#' + elemId + '_blur)');
+  batchCmd.addSubCommand(new ChangeElementCommand(elem, changes));
+  canvas.setBlurOffsets(filter, val);
+
+  curCommand = batchCmd;
+  canvas.undoMgr.beginUndoableChange('stdDeviation', [filter ? filter.firstChild : null]);
+  if (complete) {
+    canvas.setBlurNoUndo(val);
+    finishChange();
+  }
+};
+}());
+
+/**
+* @function module:svgcanvas.SvgCanvas#getText
+* @returns {string} The current text (`textContent`) of the selected element
+*/
+this.getText = function () {
+  const selected = selectedElements[0];
+  if (isNullish(selected)) { return ''; }
+  return selected.textContent;
+};
+
+/**
+* Updates the text element with the given string.
+* @function module:svgcanvas.SvgCanvas#setTextContent
+* @param {string} val - String with the new text
+* @returns {void}
+*/
+this.setTextContent = function (val) {
+  changeSelectedAttribute('#text', val);
+  textActions.init(val);
+  textActions.setCursor();
+};
+
+
+
+/**
+* Sets the `rx` and `ry` values to the selected `rect` element
+* to change its corner radius.
+* @function module:svgcanvas.SvgCanvas#setRectRadius
+* @param {string|Float} val - The new radius
+* @fires module:svgcanvas.SvgCanvas#event:changed
+* @returns {void}
+*/
+this.setRectRadius = function (val) {
+  const selected = selectedElements[0];
+  if (!isNullish(selected) && selected.tagName === 'rect') {
+    const r = selected.getAttribute('rx');
+    if (r !== String(val)) {
+      selected.setAttribute('rx', val);
+      selected.setAttribute('ry', val);
+      addCommandToHistory(new ChangeElementCommand(selected, {rx: r, ry: r}, 'Radius'));
+      call('changed', [selected]);
+    }
+  }
+};
+
+/**
+* Wraps the selected element(s) in an anchor element or converts group to one.
+* @function module:svgcanvas.SvgCanvas#makeHyperlink
+* @param {string} url
+* @returns {void}
+*/
+this.makeHyperlink = function (url) {
+  canvas.groupSelectedElements('a', url);
+
+  // TODO: If element is a single "g", convert to "a"
+  //  if (selectedElements.length > 1 && selectedElements[1]) {
+};
+
+/**
+* @function module:svgcanvas.SvgCanvas#removeHyperlink
+* @returns {void}
+*/
+this.removeHyperlink = function () {
+  canvas.ungroupSelectedElement();
+};
+
+/**
+* Group: Element manipulation.
+*/
+
+/**
+* Sets the new segment type to the selected segment(s).
+* @function module:svgcanvas.SvgCanvas#setSegType
+* @param {Integer} newType - New segment type. See {@link https://www.w3.org/TR/SVG/paths.html#InterfaceSVGPathSeg} for list
+* @returns {void}
+*/
+this.setSegType = function (newType) {
+  pathActions.setSegType(newType);
+};
+
+/**
+* Convert selected element to a path, or get the BBox of an element-as-path.
+* @function module:svgcanvas.SvgCanvas#convertToPath
+* @todo (codedread): Remove the getBBox argument and split this function into two.
+* @param {Element} elem - The DOM element to be converted
+* @param {boolean} getBBox - Boolean on whether or not to only return the path's BBox
+* @returns {void|DOMRect|false|SVGPathElement|null} If the getBBox flag is true, the resulting path's bounding box object.
+* Otherwise the resulting path element is returned.
+*/
+this.convertToPath = function (elem, getBBox) {
+  if (isNullish(elem)) {
+    const elems = selectedElements;
+    $.each(elems, function (i, el) {
+      if (el) { canvas.convertToPath(el); }
+    });
+    return undefined;
+  }
+  if (getBBox) {
+    return getBBoxOfElementAsPath(elem, addSVGElementFromJson, pathActions);
+  }
+  // TODO: Why is this applying attributes from curShape, then inside utilities.convertToPath it's pulling addition attributes from elem?
+  // TODO: If convertToPath is called with one elem, curShape and elem are probably the same; but calling with multiple is a bug or cool feature.
+  const attrs = {
+    fill: curShape.fill,
+    'fill-opacity': curShape.fill_opacity,
+    stroke: curShape.stroke,
+    'stroke-width': curShape.stroke_width,
+    'stroke-dasharray': curShape.stroke_dasharray,
+    'stroke-linejoin': curShape.stroke_linejoin,
+    'stroke-linecap': curShape.stroke_linecap,
+    'stroke-opacity': curShape.stroke_opacity,
+    opacity: curShape.opacity,
+    visibility: 'hidden'
+  };
+  return convertToPath(elem, attrs, addSVGElementFromJson, pathActions, clearSelection, addToSelection, hstry, addCommandToHistory);
+};
+
+/**
+* This function makes the changes to the elements. It does not add the change
+* to the history stack.
+* @param {string} attr - Attribute name
+* @param {string|Float} newValue - String or number with the new attribute value
+* @param {Element[]} elems - The DOM elements to apply the change to
+* @returns {void}
+*/
+const changeSelectedAttributeNoUndo = function (attr, newValue, elems) {
+  if (currentMode === 'pathedit') {
+    // Editing node
+    pathActions.moveNode(attr, newValue);
+  }
+  elems = elems || selectedElements;
+  let i = elems.length;
+  const noXYElems = ['g', 'polyline', 'path'];
+  // const goodGAttrs = ['transform', 'opacity', 'filter'];
+
+  while (i--) {
+    let elem = elems[i];
+    if (isNullish(elem)) { continue; }
+
+    // Set x,y vals on elements that don't have them
+    if ((attr === 'x' || attr === 'y') && noXYElems.includes(elem.tagName)) {
+      const bbox = getStrokedBBoxDefaultVisible([elem]);
+      const diffX = attr === 'x' ? newValue - bbox.x : 0;
+      const diffY = attr === 'y' ? newValue - bbox.y : 0;
+      canvas.moveSelectedElements(diffX * currentZoom, diffY * currentZoom, true);
+      continue;
+    }
+
+    // only allow the transform/opacity/filter attribute to change on <g> elements, slightly hacky
+    // TODO: Missing statement body
+    // if (elem.tagName === 'g' && goodGAttrs.includes(attr)) {}
+    let oldval = attr === '#text' ? elem.textContent : elem.getAttribute(attr);
+    if (isNullish(oldval)) { oldval = ''; }
+    if (oldval !== String(newValue)) {
+      if (attr === '#text') {
+        // const oldW = utilsGetBBox(elem).width;
+        elem.textContent = newValue;
+
+        // FF bug occurs on on rotated elements
+        if ((/rotate/).test(elem.getAttribute('transform'))) {
+          elem = ffClone(elem);
+        }
+        // Hoped to solve the issue of moving text with text-anchor="start",
+        // but this doesn't actually fix it. Hopefully on the right track, though. -Fyrd
+        // const box = getBBox(elem), left = box.x, top = box.y, {width, height} = box,
+        //   dx = width - oldW, dy = 0;
+        // const angle = getRotationAngle(elem, true);
+        // if (angle) {
+        //   const r = Math.sqrt(dx * dx + dy * dy);
+        //   const theta = Math.atan2(dy, dx) - angle;
+        //   dx = r * Math.cos(theta);
+        //   dy = r * Math.sin(theta);
+        //
+        //   elem.setAttribute('x', elem.getAttribute('x') - dx);
+        //   elem.setAttribute('y', elem.getAttribute('y') - dy);
+        // }
+      } else if (attr === '#href') {
+        setHref(elem, newValue);
+      } else { elem.setAttribute(attr, newValue); }
+
+      // Go into "select" mode for text changes
+      // NOTE: Important that this happens AFTER elem.setAttribute() or else attributes like
+      // font-size can get reset to their old value, ultimately by svgEditor.updateContextPanel(),
+      // after calling textActions.toSelectMode() below
+      if (currentMode === 'textedit' && attr !== '#text' && elem.textContent.length) {
+        textActions.toSelectMode(elem);
+      }
+
+      // if (i === 0) {
+      //   selectedBBoxes[0] = utilsGetBBox(elem);
+      // }
+
+      // Use the Firefox ffClone hack for text elements with gradients or
+      // where other text attributes are changed.
+      if (isGecko() && elem.nodeName === 'text' && (/rotate/).test(elem.getAttribute('transform'))) {
+        if (String(newValue).startsWith('url') || (['font-size', 'font-family', 'x', 'y'].includes(attr) && elem.textContent)) {
+          elem = ffClone(elem);
+        }
+      }
+      // Timeout needed for Opera & Firefox
+      // codedread: it is now possible for this function to be called with elements
+      // that are not in the selectedElements array, we need to only request a
+      // selector if the element is in that array
+      if (selectedElements.includes(elem)) {
+        setTimeout(function () {
+          // Due to element replacement, this element may no longer
+          // be part of the DOM
+          if (!elem.parentNode) { return; }
+          selectorManager.requestSelector(elem).resize();
+        }, 0);
+      }
+      // if this element was rotated, and we changed the position of this element
+      // we need to update the rotational transform attribute
+      const angle = getRotationAngle(elem);
+      if (angle !== 0 && attr !== 'transform') {
+        const tlist = getTransformList(elem);
+        let n = tlist.numberOfItems;
+        while (n--) {
+          const xform = tlist.getItem(n);
+          if (xform.type === 4) {
+            // remove old rotate
+            tlist.removeItem(n);
+
+            const box = utilsGetBBox(elem);
+            const center = transformPoint(box.x + box.width / 2, box.y + box.height / 2, transformListToTransform(tlist).matrix);
+            const cx = center.x,
+              cy = center.y;
+            const newrot = this.svgroot.createSVGTransform();
+            newrot.setRotate(angle, cx, cy);
+            tlist.insertItemBefore(newrot, n);
+            break;
+          }
+        }
+      }
+    } // if oldValue != newValue
+  } // for each elem
+};
+
+/**
+* Change the given/selected element and add the original value to the history stack.
+* If you want to change all `selectedElements`, ignore the `elems` argument.
+* If you want to change only a subset of `selectedElements`, then send the
+* subset to this function in the `elems` argument.
+* @function module:svgcanvas.SvgCanvas#changeSelectedAttribute
+* @param {string} attr - String with the attribute name
+* @param {string|Float} val - String or number with the new attribute value
+* @param {Element[]} elems - The DOM elements to apply the change to
+* @returns {void}
+*/
+const changeSelectedAttribute = this.changeSelectedAttribute = function (attr, val, elems) {
+  elems = elems || selectedElements;
+  canvas.undoMgr.beginUndoableChange(attr, elems);
+  // const i = elems.length;
+
+  changeSelectedAttributeNoUndo(attr, val, elems);
+
+  const batchCmd = canvas.undoMgr.finishUndoableChange();
+  if (!batchCmd.isEmpty()) {
+    addCommandToHistory(batchCmd);
+  }
+};
+
+
+/**
+* Group: Additional editor tools.
+*/
+
+/**
+* @name module:svgcanvas.SvgCanvas#contentW
+* @type {Float}
+*/
+this.contentW = getResolution().w;
+/**
+* @name module:svgcanvas.SvgCanvas#contentH
+* @type {Float}
+*/
+this.contentH = getResolution().h;
+
+/**
+* @typedef {PlainObject} module:svgcanvas.CanvasInfo
+* @property {Float} x - The canvas' new x coordinate
+* @property {Float} y - The canvas' new y coordinate
+* @property {string} oldX - The canvas' old x coordinate
+* @property {string} oldY - The canvas' old y coordinate
+* @property {Float} d_x - The x position difference
+* @property {Float} d_y - The y position difference
+*/
+
+/**
+* Updates the editor canvas width/height/position after a zoom has occurred.
+* @function module:svgcanvas.SvgCanvas#updateCanvas
+* @param {Float} w - Float with the new width
+* @param {Float} h - Float with the new height
+* @fires module:svgcanvas.SvgCanvas#event:ext_canvasUpdated
+* @returns {module:svgcanvas.CanvasInfo}
+*/
+this.updateCanvas = function (w, h) {
+  this.svgroot.setAttribute('width', w);
+  this.svgroot.setAttribute('height', h);
+  const bg = $('#canvasBackground')[0];
+  const oldX = this.svgContent.getAttribute('x');
+  const oldY = this.svgContent.getAttribute('y');
+  const x = ((w - this.contentW * currentZoom) / 2);
+  const y = ((h - this.contentH * currentZoom) / 2);
+
+  assignAttributes(svgcontent, {
+    width: this.contentW * currentZoom,
+    height: this.contentH * currentZoom,
+    x,
+    y,
+    viewBox: '0 0 ' + this.contentW + ' ' + this.contentH
+  });
+
+  assignAttributes(bg, {
+    width: this.svgContent.getAttribute('width'),
+    height: this.svgContent.getAttribute('height'),
+    x,
+    y
+  });
+
+  const bgImg = getElem('background_image');
+  if (bgImg) {
+    assignAttributes(bgImg, {
+      width: '100%',
+      height: '100%'
+    });
+  }
+
+  selectorManager.selectorParentGroup.setAttribute('transform', 'translate(' + x + ',' + y + ')');
+
+  /**
+  * Invoked upon updates to the canvas.
+  * @event module:svgcanvas.SvgCanvas#event:ext_canvasUpdated
+  * @type {PlainObject}
+  * @property {Integer} new_x
+  * @property {Integer} new_y
+  * @property {string} old_x (Of Integer)
+  * @property {string} old_y (Of Integer)
+  * @property {Integer} d_x
+  * @property {Integer} d_y
+  */
+  runExtensions(
+    'canvasUpdated',
+    /**
+     * @type {module:svgcanvas.SvgCanvas#event:ext_canvasUpdated}
+     */
+    {new_x: x, new_y: y, old_x: oldX, old_y: oldY, d_x: x - oldX, d_y: y - oldY}
+  );
+  return {x, y, old_x: oldX, old_y: oldY, d_x: x - oldX, d_y: y - oldY};
+};
+
+/**
+* Set the background of the editor (NOT the actual document).
+* @function module:svgcanvas.SvgCanvas#setBackground
+* @param {string} color - String with fill color to apply
+* @param {string} url - URL or path to image to use
+* @returns {void}
+*/
+this.setBackground = function (color, url) {
+  const bg = getElem('canvasBackground');
+  const border = $(bg).find('rect')[0];
+  let bgImg = getElem('background_image');
+  let bgPattern = getElem('background_pattern');
+  border.setAttribute('fill', color === 'chessboard' ? '#fff' : color);
+  if (color === 'chessboard') {
+    if (!bgPattern) {
+      bgPattern = this.svgdoc.createElementNS(NS.SVG, 'foreignObject');
+      assignAttributes(bgPattern, {
+        id: 'background_pattern',
+        width: '100%',
+        height: '100%',
+        preserveAspectRatio: 'xMinYMin',
+        style: 'pointer-events:none'
+      });
+      const div = document.createElement('div');
+      assignAttributes(div, {
+        style: 'pointer-events:none;width:100%;height:100%;background-image:url(data:image/gif;base64,R0lGODlhEAAQAIAAAP///9bW1iH5BAAAAAAALAAAAAAQABAAAAIfjG+gq4jM3IFLJgpswNly/XkcBpIiVaInlLJr9FZWAQA7);'
+      });
+      bgPattern.appendChild(div);
+      bg.append(bgPattern);
+    }
+  } else if (bgPattern) {
+    bgPattern.remove();
+  }
+  if (url) {
+    if (!bgImg) {
+      bgImg = this.svgdoc.createElementNS(NS.SVG, 'image');
+      assignAttributes(bgImg, {
+        id: 'background_image',
+        width: '100%',
+        height: '100%',
+        preserveAspectRatio: 'xMinYMin',
+        style: 'pointer-events:none'
+      });
+    }
+    setHref(bgImg, url);
+    bg.append(bgImg);
+  } else if (bgImg) {
+    bgImg.remove();
+  }
+};
+
+/**
+* Select the next/previous element within the current layer.
+* @function module:svgcanvas.SvgCanvas#cycleElement
+* @param {boolean} next - true = next and false = previous element
+* @fires module:svgcanvas.SvgCanvas#event:selected
+* @returns {void}
+*/
+this.cycleElement = function (next) {
+  let num;
+  const curElem = selectedElements[0];
+  let elem = false;
+  const allElems = getVisibleElements(currentGroup || this.getCurrentDrawing().getCurrentLayer());
+  if (!allElems.length) { return; }
+  if (isNullish(curElem)) {
+    num = next ? allElems.length - 1 : 0;
+    elem = allElems[num];
+  } else {
+    let i = allElems.length;
+    while (i--) {
+      if (allElems[i] === curElem) {
+        num = next ? i - 1 : i + 1;
+        if (num >= allElems.length) {
+          num = 0;
+        } else if (num < 0) {
+          num = allElems.length - 1;
+        }
+        elem = allElems[num];
+        break;
+      }
+    }
+  }
+  selectOnly([elem], true);
+  call('selected', selectedElements);
+};
+
+this.clear();
+
+/**
+* @interface module:svgcanvas.PrivateMethods
+* @type {PlainObject}
+* @property {module:svgcanvas~addCommandToHistory} addCommandToHistory
+* @property {module:history.HistoryCommand} BatchCommand
+* @property {module:history.HistoryCommand} ChangeElementCommand
+* @property {module:utilities.decode64} decode64
+* @property {module:utilities.dropXMLInternalSubset} dropXMLInternalSubset
+* @property {module:utilities.encode64} encode64
+* @property {module:svgcanvas~ffClone} ffClone
+* @property {module:svgcanvas~findDuplicateGradient} findDuplicateGradient
+* @property {module:utilities.getPathBBox} getPathBBox
+* @property {module:units.getTypeMap} getTypeMap
+* @property {module:draw.identifyLayers} identifyLayers
+* @property {module:history.HistoryCommand} InsertElementCommand
+* @property {module:browser.isChrome} isChrome
+* @property {module:math.isIdentity} isIdentity
+* @property {module:browser.isIE} isIE
+* @property {module:svgcanvas~logMatrix} logMatrix
+* @property {module:history.HistoryCommand} MoveElementCommand
+* @property {module:namespaces.NS} NS
+* @property {module:utilities.preventClickDefault} preventClickDefault
+* @property {module:history.HistoryCommand} RemoveElementCommand
+* @property {module:SVGTransformList.SVGEditTransformList} SVGEditTransformList
+* @property {module:utilities.text2xml} text2xml
+* @property {module:math.transformBox} transformBox
+* @property {module:math.transformPoint} transformPoint
+* @property {module:utilities.walkTree} walkTree
+*/
+/**
+* @deprecated getPrivateMethods
+* Since all methods are/should be public somehow, this function should be removed;
+*  we might require `import` in place of this in the future once ES6 Modules
+*  widespread
+
+* Being able to access private methods publicly seems wrong somehow,
+* but currently appears to be the best way to allow testing and provide
+* access to them to plugins.
+* @function module:svgcanvas.SvgCanvas#getPrivateMethods
+* @returns {module:svgcanvas.PrivateMethods}
+*/
+this.getPrivateMethods = function () {
+  const obj = {
+    addCommandToHistory,
+    BatchCommand,
+    ChangeElementCommand,
+    decode64,
+    dropXMLInternalSubset,
+    encode64,
+    ffClone,
+    findDefs,
+    findDuplicateGradient,
+    getElem,
+    getPathBBox,
+    getTypeMap,
+    getUrlFromAttr,
+    identifyLayers: draw.identifyLayers,
+    InsertElementCommand,
+    isChrome,
+    isIdentity,
+    isIE,
+    logMatrix,
+    MoveElementCommand,
+    NS,
+    preventClickDefault,
+    RemoveElementCommand,
+    SVGEditTransformList,
+    text2xml,
+    transformBox,
+    transformPoint,
+    walkTree
+  };
+  return obj;
+};
+  } // End constructor
+  /**
+  * Changes the ID prefix to the given value.
+  * @function module:svgcanvas.SvgCanvas#setIdPrefix
+  * @param {string} p - String with the new prefix
+  * @returns {void}
+  */
+  setIdPrefix (p) {
+    this.idprefix = p;
+  }
+
+  /**
+  * This function resets the svgcontent element while keeping it in the DOM.
+  * @function module:svgcanvas.SvgCanvas#clearSvgContentElement
+  * @returns {void}
+  */
+  clearSvgContentElement() {
+    $(this.svgcontent).empty();
+    // TODO: Clear out all other attributes first?
+    $(this.svgcontent).attr({
+      id: 'svgcontent',
+      width: dimensions[0],
+      height: dimensions[1],
+      x: dimensions[0],
+      y: dimensions[1],
+      overflow: curConfig.show_outside_canvas ? 'visible' : 'hidden',
+      xmlns: NS.SVG,
+      'xmlns:se': NS.SE,
+      'xmlns:xlink': NS.XLINK
+    }).appendTo(this.svgroot);
+
+    // TODO: make this string optional and set by the client
+    const comment = this.svgdoc.createComment(' Created with SVG-edit - https://github.com/SVG-Edit/svgedit');
+    this.svgContent.append(comment);
+  };
+  /**
+  * Returns the current Drawing.
+  * @name module:svgcanvas.SvgCanvas#getCurrentDrawing
+  * @type {module:draw.DrawCanvasInit#getCurrentDrawing}
+  */
+  getCurrentDrawing() {
+    return this.current_drawing_;
+  };
+  /**
+  * @type {module:draw.DrawCanvasInit#getSVGContent|module:utilities.EditorContext#getSVGContent}
+  */
+  getSVGContent() {
+    return this.svgContent;
+  };
+
+  /**
+  * @name module:svgcanvas.SvgCanvas#getSelectedElements
+  * @type {module:utilities.EditorContext#getSelectedElements|module:draw.DrawCanvasInit#getSelectedElements|module:path.EditorContext#getSelectedElements}
+  */
+  getSelectedElements = this.getSelectedElems = function () {
+  return selectedElements;
+};
+
+/**
+* @type {module:utilities.EditorContext#getSVGRoot|module:recalculate.EditorContext#getSVGRoot|module:coords.EditorContext#getSVGRoot|module:path.EditorContext#getSVGRoot}
+*/
+const getSVGRoot = () => this.svgroot;
+/**
+* This should actually be an intersection not a union as all should apply.
+* @type {module:coords.EditorContext#getGridSnapping|module:path.EditorContext#getGridSnapping}
+*/
+const getGridSnapping = () => { return curConfig.gridSnapping; };
+} // End class
+
+export default SvgCanvas;

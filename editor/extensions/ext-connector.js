@@ -573,60 +573,61 @@ export default {
       },
       elementChanged (opts) {
         let elem = opts.elems[0];
-        if (elem && elem.tagName === 'svg' && elem.id === 'svgcontent') {
-          // Update svgcontent (can change on import)
-          svgcontent = elem;
-          init();
-        }
-
-        // Has marker, so change offset
-        if (elem && (
-          elem.getAttribute('marker-start') ||
-          elem.getAttribute('marker-mid') ||
-          elem.getAttribute('marker-end')
-        )) {
-          const start = elem.getAttribute('marker-start');
-          const mid = elem.getAttribute('marker-mid');
-          const end = elem.getAttribute('marker-end');
-          curLine = elem;
-          $(elem)
-            .data('start_off', Boolean(start))
-            .data('end_off', Boolean(end));
-
-          if (elem.tagName === 'line' && mid) {
-            // Convert to polyline to accept mid-arrow
-
-            const x1 = Number(elem.getAttribute('x1'));
-            const x2 = Number(elem.getAttribute('x2'));
-            const y1 = Number(elem.getAttribute('y1'));
-            const y2 = Number(elem.getAttribute('y2'));
-            const {id} = elem;
-
-            const midPt = (' ' + ((x1 + x2) / 2) + ',' + ((y1 + y2) / 2) + ' ');
-            const pline = addElem({
-              element: 'polyline',
-              attr: {
-                points: (x1 + ',' + y1 + midPt + x2 + ',' + y2),
-                stroke: elem.getAttribute('stroke'),
-                'stroke-width': elem.getAttribute('stroke-width'),
-                'marker-mid': mid,
-                fill: 'none',
-                opacity: elem.getAttribute('opacity') || 1
-              }
-            });
-            $(elem).after(pline).remove();
-            svgCanvas.clearSelection();
-            pline.id = id;
-            svgCanvas.addToSelection([pline]);
-            elem = pline;
+        if (elem) {
+          if (elem.tagName === 'svg' && elem.id === 'svgcontent') {
+            // Update svgcontent (can change on import)
+            svgcontent = elem;
+            init();
           }
-        }
-        // Update line if it's a connector
-        if (elem.getAttribute('class') === connSel.substr(1)) {
-          const start = getElem(elData(elem, 'c_start'));
-          updateConnectors([start]);
-        } else {
-          updateConnectors();
+          // Has marker, so change offset
+          if (
+            elem.getAttribute('marker-start') ||
+            elem.getAttribute('marker-mid') ||
+            elem.getAttribute('marker-end')
+          ) {
+            const start = elem.getAttribute('marker-start');
+            const mid = elem.getAttribute('marker-mid');
+            const end = elem.getAttribute('marker-end');
+            curLine = elem;
+            $(elem)
+              .data('start_off', Boolean(start))
+              .data('end_off', Boolean(end));
+
+            if (elem.tagName === 'line' && mid) {
+              // Convert to polyline to accept mid-arrow
+
+              const x1 = Number(elem.getAttribute('x1'));
+              const x2 = Number(elem.getAttribute('x2'));
+              const y1 = Number(elem.getAttribute('y1'));
+              const y2 = Number(elem.getAttribute('y2'));
+              const {id} = elem;
+
+              const midPt = (' ' + ((x1 + x2) / 2) + ',' + ((y1 + y2) / 2) + ' ');
+              const pline = addElem({
+                element: 'polyline',
+                attr: {
+                  points: (x1 + ',' + y1 + midPt + x2 + ',' + y2),
+                  stroke: elem.getAttribute('stroke'),
+                  'stroke-width': elem.getAttribute('stroke-width'),
+                  'marker-mid': mid,
+                  fill: 'none',
+                  opacity: elem.getAttribute('opacity') || 1
+                }
+              });
+              $(elem).after(pline).remove();
+              svgCanvas.clearSelection();
+              pline.id = id;
+              svgCanvas.addToSelection([pline]);
+              elem = pline;
+            }
+          }
+          // Update line if it's a connector
+          if (elem.getAttribute('class') === connSel.substr(1)) {
+            const start = getElem(elData(elem, 'c_start'));
+            updateConnectors([start]);
+          } else {
+            updateConnectors();
+          }
         }
       },
       IDsUpdated (input) {
