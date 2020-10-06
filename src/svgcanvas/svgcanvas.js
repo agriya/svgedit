@@ -33,6 +33,7 @@ import {
   setLayerVisibility, moveSelectedToLayer, mergeLayer, mergeAllLayers,
   leaveContext, setContext
 } from './draw.js';
+import {svgRootElement} from './svgroot.js';
 import {sanitizeSvg} from './sanitize.js';
 import {getReverseNS, NS} from '../common/namespaces.js';
 import {
@@ -155,25 +156,7 @@ class SvgCanvas {
  * @name module:svgcanvas~svgroot
  * @type {SVGSVGElement}
  */
-    const svgroot = svgdoc.importNode(
-      text2xml(
-        '<svg id="svgroot" xmlns="' + NS.SVG + '" xlinkns="' + NS.XLINK + '" ' +
-      'width="' + dimensions[0] + '" height="' + dimensions[1] +
-        '" x="' + dimensions[0] + '" y="' + dimensions[1] + '" overflow="visible">' +
-      '<defs>' +
-        '<filter id="canvashadow" filterUnits="objectBoundingBox">' +
-          '<feGaussianBlur in="SourceAlpha" stdDeviation="4" result="blur"/>' +
-          '<feOffset in="blur" dx="5" dy="5" result="offsetBlur"/>' +
-          '<feMerge>' +
-            '<feMergeNode in="offsetBlur"/>' +
-            '<feMergeNode in="SourceGraphic"/>' +
-          '</feMerge>' +
-        '</filter>' +
-      '</defs>' +
-    '</svg>'
-      ).documentElement,
-      true
-    );
+    const svgroot = svgRootElement(svgdoc, dimensions);
     container.append(svgroot);
 
     /**
